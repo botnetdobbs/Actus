@@ -7,6 +7,7 @@ from app.config import get_settings
 from app.database import create_db_and_tables, get_session
 from app.llm.router import router as llm_router
 from app.ontology.router import router as ontology_router
+from app.auth.router import router as auth_router
 from starlette.middleware.base import BaseHTTPMiddleware
 import httpx
 import structlog
@@ -30,6 +31,7 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 async def lifespan(app: FastAPI):
     import app.llm.pii       # triggers Presidio NLP model load at startup
     import app.ontology.models  # registers all ontology types before table creation
+    import app.auth.models   # registers User and AuditLog tables
     create_db_and_tables()
     yield
 
@@ -50,6 +52,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    app.include_router(auth_router, prefix="/auth", tags=["Auth"])
     app.include_router(llm_router, prefix="/llm", tags=["LLM"])
     app.include_router(ontology_router, prefix="/ontology", tags=["Ontology"])
 

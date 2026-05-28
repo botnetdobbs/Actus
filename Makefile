@@ -7,3 +7,6 @@ check-venv:
 
 run: check-venv
 	uvicorn app.main:app --reload
+
+test: check-venv
+	python -m pytest tests/ -v

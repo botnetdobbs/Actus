@@ -1,8 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import ValidationError
 from sqlmodel import Session, select
 from app.database import get_session
 from app.ontology.registry import get_type, list_types
+from app.auth.models import User
+from app.auth.jwt import get_current_user, write_audit_log
 import structlog
 
 log = structlog.get_logger()
@@ -51,7 +53,9 @@ def get_object(
 def create_object(
     type_name: str,
     payload: dict,
+    request: Request,
     session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
 ):
     try:
         cls = get_type(type_name)
@@ -67,6 +71,7 @@ def create_object(
         obj = cls(**payload)
     except (ValidationError, TypeError) as e:
         raise HTTPException(status_code=422, detail=str(e))
+    obj.created_by = user.id
     try:
         session.add(obj)
         session.commit()
@@ -75,7 +80,9 @@ def create_object(
         session.rollback()
         log.error("ontology_create_failed", type=type_name, error=str(e))
         raise HTTPException(status_code=422, detail=str(e))
-    log.info("ontology_object_created", type=type_name, id=obj.id)
+    ip = request.client.host if request.client else None
+    write_audit_log(username=user.username, action="ontology_create", resource=f"{type_name}:{obj.id}", ip=ip)
+    log.info("ontology_object_created", type=type_name, id=obj.id, by=user.username)
     return obj
 
 
@@ -84,7 +91,9 @@ def update_object(
     type_name: str,
     object_id: int,
     payload: dict,
+    request: Request,
     session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
 ):
     try:
         cls = get_type(type_name)
@@ -107,6 +116,9 @@ def update_object(
         session.rollback()
         log.error("ontology_update_failed", type=type_name, id=object_id, error=str(e))
         raise HTTPException(status_code=422, detail=str(e))
+    ip = request.client.host if request.client else None
+    write_audit_log(username=user.username, action="ontology_update", resource=f"{type_name}:{object_id}", ip=ip)
+    log.info("ontology_object_updated", type=type_name, id=object_id, by=user.username)
     return obj
 
 
@@ -114,7 +126,9 @@ def update_object(
 def delete_object(
     type_name: str,
     object_id: int,
+    request: Request,
     session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
 ):
     try:
         cls = get_type(type_name)
@@ -123,7 +137,9 @@ def delete_object(
     obj = session.get(cls, object_id)
     if not obj or obj.is_deleted:
         raise HTTPException(status_code=404, detail="Object not found")
-    obj.soft_delete()
+    obj.soft_delete(deleted_by=user.id)
     session.add(obj)
     session.commit()
-    log.info("ontology_object_deleted", type=type_name, id=object_id)
+    ip = request.client.host if request.client else None
+    write_audit_log(username=user.username, action="ontology_delete", resource=f"{type_name}:{object_id}", ip=ip)
+    log.info("ontology_object_deleted", type=type_name, id=object_id, by=user.username)
