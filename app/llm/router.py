@@ -9,6 +9,7 @@ from slowapi.util import get_remote_address
 from app.config import get_settings, Settings
 from app.llm.models import CompletionRequest, CompletionResponse
 from app.llm.pii import scrub_pii
+from app.observability.metrics import llm_calls_total, llm_latency
 import structlog
 
 log = structlog.get_logger()
@@ -68,14 +69,21 @@ async def complete(
         )
 
     start = time.monotonic()
-    response = await call_llm_with_retry(
-        model=model,
-        messages=clean_messages,
-        max_tokens=req.max_tokens,
-        temperature=req.temperature,
-        api_base=settings.ollama_base_url if "ollama" in model else None,
-    )
-    latency_ms = (time.monotonic() - start) * 1000
+    try:
+        response = await call_llm_with_retry(
+            model=model,
+            messages=clean_messages,
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+            api_base=settings.ollama_base_url if "ollama" in model else None,
+        )
+    except Exception:
+        llm_calls_total.labels(model=model, status="error").inc()
+        raise
+    latency_s = time.monotonic() - start
+    llm_calls_total.labels(model=model, status="ok").inc()
+    llm_latency.labels(model=model).observe(latency_s)
+    latency_ms = latency_s * 1000
     cost = litellm.completion_cost(completion_response=response)
     log.info(
         "llm_call_complete",

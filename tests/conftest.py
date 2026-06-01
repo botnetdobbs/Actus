@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, SQLModel, create_engine
 from sqlmodel.pool import StaticPool
+from unittest.mock import patch
 import app.database as db_module
 from app.main import create_app
 from app.database import get_session
@@ -34,7 +35,10 @@ def client(engine):
         with Session(engine) as session:
             yield session
 
-    application = create_app()
+    # instrument_app registers Prometheus metrics into the global registry.
+    # Re-registering on each test raises ValueError, so we suppress it in tests.
+    with patch("app.main.instrument_app"):
+        application = create_app()
     application.dependency_overrides[get_session] = override_session
 
     with TestClient(application, raise_server_exceptions=False) as c:

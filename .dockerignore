@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.db
+.env
+.env.*
+tests/
+doc/
+.git/
+.gitignore
+pyrightconfig.json
+README.md
+Makefile

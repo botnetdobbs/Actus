@@ -9,6 +9,7 @@ from app.context.store import save_context
 from app.config import get_settings
 from app.llm.pii import scrub_pii
 from app.llm.router import call_llm_with_retry
+from app.observability.metrics import active_agent_runs, agent_runs_total
 
 log = structlog.get_logger()
 
@@ -40,7 +41,26 @@ async def run_agent(config: AgentConfig, extra_context: dict | None = None) -> d
     run_id = str(uuid.uuid4())
     bound_log = log.bind(agent_id=config.id, run_id=run_id)
     bound_log.info("agent_run_start")
+    active_agent_runs.inc()
+    status = "unknown"
+    try:
+        result = await _run_agent_inner(config, run_id, bound_log, extra_context)
+        status = result.get("status", "unknown")
+        return result
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        active_agent_runs.dec()
+        agent_runs_total.labels(agent_id=config.id, status=status).inc()
 
+
+async def _run_agent_inner(
+    config: AgentConfig,
+    run_id: str,
+    bound_log,
+    extra_context: dict | None,
+) -> dict:
     tools_desc = json.dumps(list(_tool_schemas.values()), indent=2)
     messages = [{"role": "system", "content": config.system_prompt + TOOL_CALL_PROMPT.format(tools=tools_desc)}]
 

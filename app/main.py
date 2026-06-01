@@ -11,6 +11,8 @@ from app.auth.router import router as auth_router
 from app.agents.builder import load_agents
 from app.automation.router import router as automation_router
 from app.automation.scheduler import start_scheduler, stop_scheduler
+from app.observability.logging import configure_logging
+from app.observability.metrics import instrument_app
 from starlette.middleware.base import BaseHTTPMiddleware
 import httpx
 import structlog
@@ -20,6 +22,8 @@ import uuid
 import app.ontology.models  # noqa: F401
 import app.auth.models      # noqa: F401
 
+_settings = get_settings()
+
 log = structlog.get_logger()
 
 
@@ -28,7 +32,11 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         request_id = str(uuid.uuid4())
         request.state.request_id = request_id
         structlog.contextvars.clear_contextvars()
-        structlog.contextvars.bind_contextvars(request_id=request_id)
+        structlog.contextvars.bind_contextvars(
+            request_id=request_id,
+            path=request.url.path,
+            method=request.method,
+        )
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
         return response
@@ -36,6 +44,7 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_logging(debug=_settings.debug)
     from app.llm import pii  # noqa: F401 — Presidio NLP model load, controls when the 2-3s cost is paid
     create_db_and_tables()
     try:
@@ -52,17 +61,17 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    settings = get_settings()
     app = FastAPI(
-        title=settings.app_name,
-        version=settings.app_version,
+        title=_settings.app_name,
+        version=_settings.app_version,
         lifespan=lifespan,
     )
+    instrument_app(app)
     app.add_middleware(RequestIDMiddleware)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.cors_origins,
-        allow_credentials=settings.cors_allow_credentials,
+        allow_origins=_settings.cors_origins,
+        allow_credentials=_settings.cors_allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -82,7 +91,7 @@ def create_app() -> FastAPI:
             checks["database"] = f"error: {e}"
         try:
             async with httpx.AsyncClient(timeout=2.0) as client:
-                r = await client.get(f"{settings.ollama_base_url}/api/tags")
+                r = await client.get(f"{_settings.ollama_base_url}/api/tags")
                 checks["ollama"] = "ok" if r.status_code == 200 else "unreachable"
         except Exception:
             checks["ollama"] = "unreachable"

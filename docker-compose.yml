@@ -1,0 +1,23 @@
+services:
+  actus:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+      DATABASE_URL: ${DATABASE_URL:-sqlite:///./data/actus.db}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      DEBUG: ${DEBUG:-false}
+    volumes:
+      - ./data:/app/data          # persist SQLite database
+      - ./config/agents:/app/config/agents  # hot-reload agent YAMLs without rebuild
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Linux host resolution
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
