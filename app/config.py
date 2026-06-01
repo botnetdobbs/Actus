@@ -3,7 +3,7 @@ from pydantic import model_validator
 from functools import lru_cache
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
 
     app_name: str = "Actus"
     app_version: str = "0.1.0"

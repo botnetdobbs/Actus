@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 from typing import Any
-from pydantic import BaseModel, Field
+from enum import Enum
+from pydantic import BaseModel
+from sqlmodel import SQLModel, Field
 import uuid
 
 
@@ -32,3 +34,25 @@ class AgentContext(BaseModel):
     metadata: dict[str, Any] = {}
     assembled_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     ttl_seconds: int = 3600
+
+
+class WorkflowStatus(str, Enum):
+    pending = "pending"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+    timeout = "timeout"
+
+
+class Workflow(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    name: str
+    agent_id: str = Field(index=True)
+    status: WorkflowStatus = WorkflowStatus.pending
+    run_id: str | None = None
+    result_json: str | None = None
+    error: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    created_by: int | None = None

@@ -43,16 +43,19 @@ def test_trigger_analyst_queues_agent(client, engine):
     seed_user(engine, "analyst2", "analyst")
     token = get_token(client, "analyst2")
     with patch("app.automation.router.get_agent", return_value=make_agent_config()), \
-         patch("app.automation.router.run_agent_with_timeout", new=AsyncMock(return_value={})):
+         patch("app.automation.router._run_workflow", new=AsyncMock(return_value=None)):
         resp = client.post("/automation/trigger/test-agent", headers=auth_header(token))
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "queued", "agent_id": "test-agent"}
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["status"] == "queued"
+    assert body["agent_id"] == "test-agent"
+    assert "workflow_id" in body
 
 
 def test_trigger_admin_can_trigger(client, engine):
     seed_user(engine, "admin1", "admin")
     token = get_token(client, "admin1")
     with patch("app.automation.router.get_agent", return_value=make_agent_config()), \
-         patch("app.automation.router.run_agent_with_timeout", new=AsyncMock(return_value={})):
+         patch("app.automation.router._run_workflow", new=AsyncMock(return_value=None)):
         resp = client.post("/automation/trigger/test-agent", headers=auth_header(token))
-    assert resp.status_code == 200
+    assert resp.status_code == 202

@@ -19,70 +19,53 @@ pytest + httpx
 
 ## Quick Start
 
-**Prerequisites (both paths):** Ollama running on your machine (`ollama serve && ollama pull mistral`).
-
-### Virtual environment
-
-**Prerequisites:** Python 3.13, [uv](https://github.com/astral-sh/uv).
-
-```bash
-git clone https://github.com/you/actus && cd actus
-
-uv sync
-source .venv/bin/activate
-
-cat > .env << 'EOF'
-DEBUG=true
-SECRET_KEY=dev-secret-key-change-in-production
-DATABASE_URL=sqlite:///./actus.db
-EOF
-
-mkdir -p config/agents
-
-make run      # uvicorn with hot reload
-make test     # run the test suite
-```
-
-### Docker
-
-**Prerequisites:** Docker, Docker Compose.
+**Prerequisites:** Docker and Docker Compose.
 
 ```bash
 git clone https://github.com/you/actus && cd actus
 
 cat > .env << 'EOF'
 SECRET_KEY=your-secret-key-here
+POSTGRES_PASSWORD=your-postgres-password-here
+GRAFANA_PASSWORD=your-grafana-password-here
 DEBUG=false
-DATABASE_URL=sqlite:///./data/actus.db
-OLLAMA_BASE_URL=http://host.docker.internal:11434
 EOF
 
-make docker-up
+make docker-up-d       # start all services in background
+make ollama-pull       # pull the model into the Ollama container (first run only)
 ```
 
-The first build takes a few minutes (downloads the spaCy NLP model). Subsequent starts are fast.
+The first build takes a few minutes. The spaCy NLP model is downloaded into the image. Subsequent starts are fast. Actus starts immediately; Ollama initialises in the background (typically 1-3 minutes on first run).
 
-**Docker commands:**
+To check when Ollama is ready:
+
+```bash
+curl http://localhost:8000/healthz
+# Not ready yet:  {"status":"degraded","checks":{"database":"ok","ollama":"unreachable"}}
+# Ready:          {"status":"ok","checks":{"database":"ok","ollama":"ok"}}
+```
+
+**Services:**
+
+| Service | URL | Notes |
+|---|---|---|
+| Actus API | `http://localhost:8000` | API docs at `/docs` |
+| Prometheus | `http://localhost:9090` | Metrics storage |
+| Grafana | `http://localhost:3000` | Dashboards — login: `admin` / `GRAFANA_PASSWORD` |
+
+**Commands:**
 
 | Command | What it does |
 |---|---|
 | `make docker-up` | Build (if needed) and start in foreground |
 | `make docker-up-d` | Start in background |
-| `make docker-logs` | Tail container logs |
-| `make docker-restart` | Restart without rebuilding |
-| `make docker-down` | Stop and remove the container |
+| `make docker-logs` | Tail all service logs |
+| `make docker-restart` | Restart Actus without rebuilding |
+| `make docker-rebuild` | Rebuild image and restart all services |
+| `make docker-down` | Stop and remove all containers |
+| `make ollama-pull` | Pull a model into the Ollama container |
 
-
----
-
-**Verify either setup:**
-
-```bash
-curl http://localhost:8000/healthz
-# {"status":"ok","checks":{"database":"ok","ollama":"ok"}}
-```
-
-API docs: `http://localhost:8000/docs`
+Agent YAML files in `config/agents/` are volume-mounted — add or edit agents and `make docker-restart`, no rebuild needed. Database data persists in a Docker volume across restarts.
 
 ---
 

@@ -1,12 +1,14 @@
+import asyncio
 import logging
 import time
 import litellm
 from litellm.exceptions import APIConnectionError, Timeout, ServiceUnavailableError, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Request
+from fastapi.responses import StreamingResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-from app.config import get_settings, Settings
+from app.config import get_settings
 from app.llm.models import CompletionRequest, CompletionResponse
 from app.llm.pii import scrub_pii
 from app.observability.metrics import llm_calls_total, llm_latency
@@ -38,14 +40,11 @@ def llm_retry(fn):
 async def call_llm_with_retry(model, messages, **kwargs):
     return await litellm.acompletion(model=model, messages=messages, **kwargs)
 
+
 @router.post("/complete", response_model=CompletionResponse)
 @limiter.limit("20/minute")
-async def complete(
-    request: Request,
-    req: CompletionRequest,
-    settings: Settings = Depends(get_settings),
-):
-    model = req.model or settings.default_model
+async def complete(request: Request, req: CompletionRequest):
+    model = req.model or _settings.default_model
     pii_found = False
     clean_messages = []
 
@@ -57,7 +56,7 @@ async def complete(
         else:
             clean_messages.append(msg.model_dump())
 
-    if settings.debug:
+    if _settings.debug:
         log.debug("llm_prompt", messages=clean_messages)
     else:
         log.info(
@@ -75,7 +74,7 @@ async def complete(
             messages=clean_messages,
             max_tokens=req.max_tokens,
             temperature=req.temperature,
-            api_base=settings.ollama_base_url if "ollama" in model else None,
+            api_base=_settings.ollama_base_url if "ollama" in model else None,
         )
     except Exception:
         llm_calls_total.labels(model=model, status="error").inc()
@@ -101,4 +100,44 @@ async def complete(
         usage=dict(response.usage),
         pii_detected=pii_found,
         request_id=getattr(request.state, "request_id", None),
+    )
+
+
+@router.post("/chat/stream")
+async def chat_stream(request: Request, req: CompletionRequest):
+    model = req.model or _settings.default_model
+    clean_messages = []
+    for msg in req.messages:
+        if msg.role == "user":
+            clean_content, _ = scrub_pii(msg.content)
+            clean_messages.append({"role": msg.role, "content": clean_content})
+        else:
+            clean_messages.append(msg.model_dump())
+
+    async def token_generator():
+        try:
+            response = await litellm.acompletion(
+                model=model,
+                messages=clean_messages,
+                stream=True,
+                api_base=_settings.ollama_base_url if "ollama" in model else None,
+            )
+            async for chunk in response:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+        except asyncio.TimeoutError:
+            log.error("stream_timeout", model=model)
+            yield "\n\n[Error: LLM response timed out]"
+        except APIConnectionError:
+            log.error("stream_connection_error", model=model)
+            yield "\n\n[Error: Could not connect to LLM]"
+        except Exception as e:
+            log.error("stream_error", model=model, error=str(e))
+            yield f"\n\n[Error: {type(e).__name__}]"
+
+    return StreamingResponse(
+        token_generator(),
+        media_type="text/plain",
+        headers={"X-Request-ID": getattr(request.state, "request_id", "")},
     )

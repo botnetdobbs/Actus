@@ -1,15 +1,5 @@
-# Makefile guard
-check-venv:
-	@if [ -z "$$VIRTUAL_ENV" ]; then \
-	echo "ERROR: venv not activated. Run: source .venv/bin/activate"; \
-	exit 1; \
-	fi
-
-run: check-venv
-	uvicorn app.main:app --reload
-
-test: check-venv
-	python -m pytest tests/ -v
+test:
+	uv run python -m pytest tests/ -v
 
 # ── Docker ────────────────────────────────────────────────────────────────────
 
@@ -17,12 +7,15 @@ docker-build:
 	docker compose build
 
 docker-up:
-	mkdir -p data config/agents
+	mkdir -p config/agents
 	docker compose up
 
 docker-up-d:
-	mkdir -p data config/agents
+	mkdir -p config/agents
 	docker compose up -d
+
+ollama-pull:
+	docker compose exec ollama ollama pull mistral
 
 docker-down:
 	docker compose down
@@ -32,3 +25,6 @@ docker-logs:
 
 docker-restart:
 	docker compose restart actus
+
+docker-rebuild:
+	docker compose down && docker compose up --build -d
