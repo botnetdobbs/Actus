@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "alembic>=1.13.0",
-    "chromadb>=0.6.0",
+    "pgvector>=0.3.0",
     "sentence-transformers>=3.0.0",
     "apscheduler>=3.11.2",
     "fastapi[standard]>=0.136.3",

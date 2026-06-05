@@ -9,6 +9,7 @@ import app.ontology.models   # noqa: F401
 import app.agents.audit      # noqa: F401
 import app.context.store     # noqa: F401
 import app.context.models    # noqa: F401
+import app.rag.models         # noqa: F401
 
 from app.config import get_settings
 

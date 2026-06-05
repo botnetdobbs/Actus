@@ -2,7 +2,7 @@
 Backfill RAG index for all existing ontology objects.
 
 Run once after enabling RAG on a database that already has ontology objects.
-Safe to run multiple times — ChromaDB upserts are idempotent.
+Safe to run multiple times — pgvector upserts (ON CONFLICT DO UPDATE) are idempotent.
 
 Usage:
     uv run python scripts/backfill_rag.py
