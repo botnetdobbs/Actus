@@ -302,6 +302,14 @@ Refreshes every 2 seconds. `status` progresses: `pending` → `running` → `com
 | `invoke_agent` | Run another registered agent sequentially and return its result |
 | `invoke_agents_parallel` | Run multiple agents in parallel (up to 10), returns list of results |
 
+### Supported orchestration patterns
+
+| Pattern | Tool | When to use |
+|---|---|---|
+| **Sequential pipeline** | `invoke_agent` | Agents must run in order — output of one feeds the next |
+| **Parallel execution** | `invoke_agents_parallel` | Agents are independent — run concurrently, merge results |
+| **Hierarchical manager-specialist** | Either | Manager agent decomposes and delegates; depth limit (5) and cycle detection enforced automatically |
+
 ### Agent-to-agent invocation
 
 An agent's system prompt can instruct it to call other agents:
