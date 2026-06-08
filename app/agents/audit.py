@@ -1,5 +1,6 @@
 import json
 from datetime import datetime, timezone
+from pydantic import BaseModel, ConfigDict, computed_field, field_validator
 from sqlmodel import SQLModel, Field, Session
 from app.database import get_engine
 import structlog
@@ -25,6 +26,49 @@ class AgentRunLog(SQLModel, table=True):
     outcome: str = "success"              # "success" | "incomplete" | "error" | "timeout"
     result_summary: str | None = None     # first 500 chars only, never raw output
     ip_address: str | None = None
+
+
+class AgentRunLogResponse(BaseModel):
+    """API representation of an AgentRunLog row.
+
+    tool_calls is stored as a JSON string in the DB; this model deserialises it
+    automatically. duration_seconds is computed from started_at / completed_at.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    run_id: str
+    agent_id: str | None
+    triggered_by: int | None
+    started_at: datetime
+    completed_at: datetime | None
+    model: str | None
+    pii_detected: bool
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    tool_calls: list[dict]
+    outcome: str
+    result_summary: str | None
+    ip_address: str | None
+
+    @field_validator("tool_calls", mode="before")
+    @classmethod
+    def _parse_tool_calls(cls, v) -> list[dict]:
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except (json.JSONDecodeError, ValueError):
+                return []
+        return v or []
+
+    @computed_field
+    @property
+    def duration_seconds(self) -> float | None:
+        if self.completed_at and self.started_at:
+            return (self.completed_at - self.started_at).total_seconds()
+        return None
 
 
 def log_agent_run(

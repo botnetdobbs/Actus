@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac as _hmac
 import json
 from datetime import datetime, timezone
 from typing import Annotated
@@ -6,7 +8,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import Session, select
-from app.agents.audit import log_agent_run
+from app.agents.audit import AgentRunLog, AgentRunLogResponse, log_agent_run
 from app.agents.builder import get_agent, list_agents, reload_agents
 from app.agents.orchestrator import run_agent_with_timeout
 from app.auth.models import User
@@ -17,6 +19,15 @@ import structlog
 
 log = structlog.get_logger()
 router = APIRouter()
+
+MAX_WEBHOOK_BODY_BYTES = 1 * 1024 * 1024
+_SIG_HEADERS = ("x-actus-signature", "x-hub-signature-256")
+
+
+def _verify_webhook_signature(body: bytes, secret: str, signature: str) -> bool:
+    expected = "sha256=" + _hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return _hmac.compare_digest(expected, signature)
+
 
 _OUTCOME_MAP = {
     "completed": "success",
@@ -153,6 +164,69 @@ async def trigger_agent(
     return {"status": "queued", "agent_id": agent_id, "workflow_id": workflow_id}
 
 
+# ── Webhook trigger ───────────────────────────────────────────────────────────
+
+@router.post("/webhooks/{agent_id}", status_code=202)
+async def webhook_trigger(
+    agent_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    try:
+        config = get_agent(agent_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Agent not found: '{agent_id}'")
+
+    if not config.webhook or not config.webhook.secret:
+        raise HTTPException(status_code=403, detail="Webhook not enabled for this agent")
+
+    body = await request.body()
+    if len(body) > MAX_WEBHOOK_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Webhook payload exceeds 1 MB limit")
+
+    signature = next(
+        (request.headers.get(h) for h in _SIG_HEADERS if request.headers.get(h)),
+        None,
+    )
+    if not signature:
+        raise HTTPException(status_code=401, detail="Missing webhook signature")
+    if not _verify_webhook_signature(body, config.webhook.secret, signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    extra_context: dict | None = None
+    if body:
+        try:
+            parsed = json.loads(body)
+            extra_context = parsed if isinstance(parsed, dict) else {"payload": parsed}
+        except (json.JSONDecodeError, ValueError):
+            extra_context = {"raw": body.decode("utf-8", errors="replace")}
+
+    with Session(get_engine()) as session:
+        wf = Workflow(
+            name=config.name,
+            agent_id=agent_id,
+            created_by=None,
+            extra_context_json=json.dumps(extra_context) if extra_context else None,
+        )
+        session.add(wf)
+        session.commit()
+        session.refresh(wf)
+        workflow_id = wf.id
+
+    ip = request.client.host if request.client else None
+    background_tasks.add_task(_run_workflow, workflow_id, None, ip)
+
+    write_audit_log(
+        username="webhook",
+        action="webhook_trigger",
+        resource=agent_id,
+        ip=ip,
+        detail=f"workflow_id={workflow_id}",
+    )
+
+    return {"status": "queued", "agent_id": agent_id, "workflow_id": workflow_id}
+
+
 # ── Workflow polling ───────────────────────────────────────────────────────────
 
 @router.get("/workflows", response_model=list[WorkflowResponse])
@@ -267,6 +341,47 @@ async def stream_workflow(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ── Agent run history ─────────────────────────────────────────────────────────
+
+@router.get("/runs", response_model=list[AgentRunLogResponse])
+async def list_runs(
+    agent_id: Annotated[str | None, Query()] = None,
+    outcome: Annotated[str | None, Query()] = None,
+    triggered_by: Annotated[int | None, Query()] = None,
+    from_date: Annotated[datetime | None, Query()] = None,
+    to_date: Annotated[datetime | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_role("analyst")),
+):
+    query = select(AgentRunLog)
+    if agent_id:
+        query = query.where(AgentRunLog.agent_id == agent_id)
+    if outcome:
+        query = query.where(AgentRunLog.outcome == outcome)
+    if triggered_by is not None:
+        query = query.where(AgentRunLog.triggered_by == triggered_by)
+    if from_date:
+        query = query.where(AgentRunLog.started_at >= from_date)
+    if to_date:
+        query = query.where(AgentRunLog.started_at <= to_date)
+    query = query.order_by(AgentRunLog.started_at.desc()).offset(offset).limit(limit)
+    return session.exec(query).all()
+
+
+@router.get("/runs/{run_id}", response_model=AgentRunLogResponse)
+async def get_run(
+    run_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_role("analyst")),
+):
+    run = session.exec(select(AgentRunLog).where(AgentRunLog.run_id == run_id)).first()
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+    return run
 
 
 # ── Reload agents ─────────────────────────────────────────────────────────────

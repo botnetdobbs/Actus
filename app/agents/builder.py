@@ -10,6 +10,10 @@ class AgentSchedule(BaseModel):
     cron: str | None = None
 
 
+class WebhookConfig(BaseModel):
+    secret: str
+
+
 class AgentConfig(BaseModel):
     id: str
     name: str
@@ -26,6 +30,7 @@ class AgentConfig(BaseModel):
     rag_query_template: str = ""
     rag_top_k: int = Field(default=5, ge=1)
     schedule: AgentSchedule | None = None
+    webhook: WebhookConfig | None = None
 
 
 _agents: dict[str, AgentConfig] = {}

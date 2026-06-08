@@ -106,6 +106,7 @@ system_prompt: |
 | `rag_top_k` | int | `5` | Documents retrieved pre-loop |
 | `api_base` | str | `""` | Overrides `OLLAMA_BASE_URL` for this agent |
 | `schedule.cron` | str | None | APScheduler cron expression |
+| `webhook.secret` | str | None | HMAC-SHA256 secret; enables `POST /automation/webhooks/{id}` |
 
 ---
 
@@ -306,6 +307,42 @@ watch -n 2 curl -s "http://localhost:8000/automation/workflows/42" \
 Refreshes every 2 seconds. `status` progresses: `pending` → `running` → `completed` / `failed` / `timeout`
 
 `result_json` is the serialised agent result dict, including `result`, `confidence`, `iterations`, `tool_calls`, and token counts.
+
+### Webhook trigger (external systems)
+
+Enable a webhook on the agent by adding a `webhook.secret` to its YAML:
+
+```yaml
+# config/agents/lead_qualifier.yaml
+id: lead_qualifier
+webhook:
+  secret: "generate-with-openssl-rand-hex-32"
+tools:
+  - qualify_lead
+system_prompt: |
+  You receive a lead from the CRM in context["email"] and context["plan"].
+  Score it 1-10 and call qualify_lead with the score.
+```
+
+The external system signs the request body and sends it to `POST /automation/webhooks/{agent_id}`:
+
+```bash
+BODY='{"email": "alice@example.com", "plan": "enterprise"}'
+SECRET="generate-with-openssl-rand-hex-32"
+SIG="sha256=$(echo -n "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')"
+
+curl -X POST http://localhost:8000/automation/webhooks/lead_qualifier \
+  -H "Content-Type: application/json" \
+  -H "X-Actus-Signature: $SIG" \
+  -d "$BODY"
+# → {"status": "queued", "agent_id": "lead_qualifier", "workflow_id": 7}
+```
+
+The JSON body becomes `extra_context` directly — the agent reads it via `context["email"]`, `context["plan"]`, etc. Arrays are wrapped as `{"payload": [...]}`. Non-JSON bodies are wrapped as `{"raw": "..."}`.
+
+**GitHub webhooks** send `X-Hub-Signature-256` — Actus accepts it without any configuration. Point the GitHub webhook URL at `/automation/webhooks/{agent_id}` and use the same secret.
+
+No JWT is needed — the HMAC signature is the authentication mechanism.
 
 ---
 
