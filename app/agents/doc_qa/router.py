@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from app.auth.models import User
 from app.auth.jwt import require_role
 
-router = APIRouter()
+router = APIRouter(prefix="/doc-qa", tags=["Doc Q&A"])
 
 UPLOAD_DIR = Path("/tmp/actus-uploads")
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB

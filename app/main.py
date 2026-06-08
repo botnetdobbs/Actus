@@ -9,9 +9,9 @@ from app.llm.router import router as llm_router
 from app.ontology.router import router as ontology_router
 from app.auth.router import router as auth_router
 from app.agents.builder import load_agents
+from app.agents.discovery import discover_models, discover_routers, discover_tools
 from app.automation.router import router as automation_router
 from app.automation.scheduler import scheduler, start_scheduler, stop_scheduler
-from app.doc_qa.router import router as doc_qa_router
 from app.observability.logging import configure_logging
 from app.observability.metrics import instrument_app
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -23,7 +23,7 @@ import uuid
 import app.ontology.models  # noqa: F401
 import app.auth.models      # noqa: F401
 import app.agents.audit     # noqa: F401
-import app.doc_qa.doc_tools  # noqa: F401 — registers chunk_and_index_document, search_document, cleanup_document
+discover_models()            # registers app/agents/*/models.py table metadata
 
 _settings = get_settings()
 
@@ -51,6 +51,7 @@ async def lifespan(app: FastAPI):
     from app.llm import pii  # noqa: F401 — Presidio NLP model load, controls when the 2-3s cost is paid
     from app.rag.embedder import warmup as warmup_embedder
     warmup_embedder()
+    discover_tools()
     try:
         load_agents()
     except Exception as e:
@@ -84,7 +85,7 @@ def create_app() -> FastAPI:
     app.include_router(automation_router, prefix="/automation", tags=["Automation"])
     app.include_router(llm_router, prefix="/llm", tags=["LLM"])
     app.include_router(ontology_router, prefix="/ontology", tags=["Ontology"])
-    app.include_router(doc_qa_router, prefix="/doc-qa", tags=["Doc Q&A"])
+    discover_routers(app)    # registers app/agents/*/router.py
 
     @app.get("/healthz", tags=["Health"])
     async def health(session: Session = Depends(get_session)):

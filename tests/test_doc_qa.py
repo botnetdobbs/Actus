@@ -14,7 +14,7 @@ from tests.conftest import get_token, seed_user
 
 class TestChunkText:
     def setup_method(self):
-        from app.doc_qa.parser import _chunk_text
+        from app.agents.doc_qa.parser import _chunk_text
         self._chunk = _chunk_text
 
     def test_single_chunk_when_short(self):
@@ -57,7 +57,7 @@ class TestChunkText:
             assert len(chunk) <= 1200
 
     def test_respects_max_cap(self):
-        from app.doc_qa.parser import MAX_CHUNKS
+        from app.agents.doc_qa.parser import MAX_CHUNKS
         text = "word " * (MAX_CHUNKS * 10)
         chunks = self._chunk(text, chunk_chars=50, overlap_chars=0)
         assert len(chunks) <= MAX_CHUNKS
@@ -65,19 +65,19 @@ class TestChunkText:
 
 class TestExtractText:
     def test_file_not_found(self):
-        from app.doc_qa.parser import extract_text
+        from app.agents.doc_qa.parser import extract_text
         with pytest.raises(FileNotFoundError):
             extract_text("/nonexistent/path/file.pdf")
 
     def test_unsupported_extension(self, tmp_path):
-        from app.doc_qa.parser import extract_text
+        from app.agents.doc_qa.parser import extract_text
         f = tmp_path / "doc.txt"
         f.write_text("hello")
         with pytest.raises(ValueError, match="Unsupported"):
             extract_text(str(f))
 
     def test_pdf_success(self, tmp_path):
-        from app.doc_qa.parser import extract_text
+        from app.agents.doc_qa.parser import extract_text
         f = tmp_path / "doc.pdf"
         f.write_bytes(b"fake")
         mock_page = MagicMock()
@@ -91,7 +91,7 @@ class TestExtractText:
         assert "Some extracted text from PDF." in text
 
     def test_docx_success(self, tmp_path):
-        from app.doc_qa.parser import extract_text
+        from app.agents.doc_qa.parser import extract_text
         f = tmp_path / "doc.docx"
         f.write_bytes(b"fake")
         para1 = MagicMock()
@@ -106,7 +106,7 @@ class TestExtractText:
         assert "Second paragraph." in text
 
     def test_empty_raises(self, tmp_path):
-        from app.doc_qa.parser import extract_text
+        from app.agents.doc_qa.parser import extract_text
         f = tmp_path / "doc.pdf"
         f.write_bytes(b"fake")
         mock_page = MagicMock()
@@ -120,7 +120,7 @@ class TestExtractText:
                 extract_text(str(f))
 
     def test_pdf_password_protected(self, tmp_path):
-        from app.doc_qa.parser import extract_text
+        from app.agents.doc_qa.parser import extract_text
         f = tmp_path / "doc.pdf"
         f.write_bytes(b"fake")
         with patch("pdfplumber.open", side_effect=Exception("encrypted")):
@@ -132,16 +132,16 @@ class TestExtractText:
 
 class TestChunkAndIndexDocument:
     def _make_tools(self):
-        from app.doc_qa.doc_tools import chunk_and_index_document
+        from app.agents.doc_qa.tools import chunk_and_index_document
         return chunk_and_index_document
 
     def test_happy_path(self, tmp_path):
         tool_fn = self._make_tools()
         f = tmp_path / "doc.pdf"
         f.write_bytes(b"fake")
-        with patch("app.doc_qa.doc_tools._UPLOAD_DIR", tmp_path.resolve()), \
-             patch("app.doc_qa.doc_tools.extract_text", return_value="word " * 100), \
-             patch("app.doc_qa.doc_tools.index_text") as mock_index:
+        with patch("app.agents.doc_qa.tools._UPLOAD_DIR", tmp_path.resolve()), \
+             patch("app.agents.doc_qa.tools.extract_text", return_value="word " * 100), \
+             patch("app.agents.doc_qa.tools.index_text") as mock_index:
             result = tool_fn(str(f))
         assert "session_id" in result
         assert result["chunks_indexed"] >= 1
@@ -158,8 +158,8 @@ class TestChunkAndIndexDocument:
         tool_fn = self._make_tools()
         f = tmp_path / "scan.pdf"
         f.write_bytes(b"fake")
-        with patch("app.doc_qa.doc_tools._UPLOAD_DIR", tmp_path.resolve()), \
-             patch("app.doc_qa.doc_tools.extract_text", side_effect=ValueError("No extractable text")):
+        with patch("app.agents.doc_qa.tools._UPLOAD_DIR", tmp_path.resolve()), \
+             patch("app.agents.doc_qa.tools.extract_text", side_effect=ValueError("No extractable text")):
             with pytest.raises(ValueError, match="No extractable text"):
                 tool_fn(str(f))
 
@@ -172,9 +172,9 @@ class TestChunkAndIndexDocument:
             call_count[0] += 1
             if call_count[0] == 1:
                 raise RuntimeError("simulated failure")
-        with patch("app.doc_qa.doc_tools._UPLOAD_DIR", tmp_path.resolve()), \
-             patch("app.doc_qa.doc_tools.extract_text", return_value="word " * 300), \
-             patch("app.doc_qa.doc_tools.index_text", side_effect=flaky_index):
+        with patch("app.agents.doc_qa.tools._UPLOAD_DIR", tmp_path.resolve()), \
+             patch("app.agents.doc_qa.tools.extract_text", return_value="word " * 300), \
+             patch("app.agents.doc_qa.tools.index_text", side_effect=flaky_index):
             result = tool_fn(str(f))
         assert result["chunks_indexed"] >= 1
         assert result["warning"] is not None
@@ -183,20 +183,20 @@ class TestChunkAndIndexDocument:
         tool_fn = self._make_tools()
         f = tmp_path / "doc.pdf"
         f.write_bytes(b"fake")
-        with patch("app.doc_qa.doc_tools._UPLOAD_DIR", tmp_path.resolve()), \
-             patch("app.doc_qa.doc_tools.extract_text", return_value="word " * 100), \
-             patch("app.doc_qa.doc_tools.index_text", side_effect=RuntimeError("always fails")):
+        with patch("app.agents.doc_qa.tools._UPLOAD_DIR", tmp_path.resolve()), \
+             patch("app.agents.doc_qa.tools.extract_text", return_value="word " * 100), \
+             patch("app.agents.doc_qa.tools.index_text", side_effect=RuntimeError("always fails")):
             with pytest.raises(RuntimeError, match="0/"):
                 tool_fn(str(f))
 
     def test_path_traversal_blocked(self, tmp_path):
-        from app.doc_qa.doc_tools import chunk_and_index_document
+        from app.agents.doc_qa.tools import chunk_and_index_document
         # A path outside the upload dir should be rejected before any IO
         with pytest.raises((ValueError, FileNotFoundError)):
             chunk_and_index_document("/etc/passwd")
 
     def test_symlink_traversal_blocked(self, tmp_path):
-        from app.doc_qa.doc_tools import chunk_and_index_document, _UPLOAD_DIR
+        from app.agents.doc_qa.tools import chunk_and_index_document, _UPLOAD_DIR
         # Symlink inside upload dir pointing outside — resolve() should catch it
         evil_target = tmp_path / "secret.txt"
         evil_target.write_text("secret")
@@ -213,11 +213,11 @@ class TestChunkAndIndexDocument:
 
 class TestSearchDocument:
     def test_calls_retrieve_with_session_type(self):
-        from app.doc_qa.doc_tools import search_document
+        from app.agents.doc_qa.tools import search_document
         mock_results = [
             {"document": "chunk text", "metadata": {"object_id": 0}, "score": 0.9}
         ]
-        with patch("app.doc_qa.doc_tools.retrieve", return_value=mock_results) as mock_r:
+        with patch("app.agents.doc_qa.tools.retrieve", return_value=mock_results) as mock_r:
             result = search_document("abc-123", "what is the main finding?", top_k=3)
         mock_r.assert_called_once_with("what is the main finding?", type_name="doc:abc-123", top_k=3)
         assert result[0]["text"] == "chunk text"
@@ -225,12 +225,12 @@ class TestSearchDocument:
         assert result[0]["score"] == 0.9
 
     def test_formats_results_correctly(self):
-        from app.doc_qa.doc_tools import search_document
+        from app.agents.doc_qa.tools import search_document
         mock_results = [
             {"document": "passage A", "metadata": {"object_id": 2}, "score": 0.75},
             {"document": "passage B", "metadata": {"object_id": 5}, "score": 0.55},
         ]
-        with patch("app.doc_qa.doc_tools.retrieve", return_value=mock_results):
+        with patch("app.agents.doc_qa.tools.retrieve", return_value=mock_results):
             result = search_document("sid", "query")
         assert len(result) == 2
         assert result[1]["chunk_index"] == 5
@@ -238,15 +238,15 @@ class TestSearchDocument:
 
 class TestCleanupDocument:
     def test_calls_delete_by_type_with_prefix(self):
-        from app.doc_qa.doc_tools import cleanup_document
-        with patch("app.doc_qa.doc_tools.delete_by_type", return_value=7) as mock_del:
+        from app.agents.doc_qa.tools import cleanup_document
+        with patch("app.agents.doc_qa.tools.delete_by_type", return_value=7) as mock_del:
             result = cleanup_document("my-session-id")
         mock_del.assert_called_once_with("doc:my-session-id")
         assert result["deleted_chunks"] == 7
 
     def test_idempotent_returns_zero(self):
-        from app.doc_qa.doc_tools import cleanup_document
-        with patch("app.doc_qa.doc_tools.delete_by_type", return_value=0):
+        from app.agents.doc_qa.tools import cleanup_document
+        with patch("app.agents.doc_qa.tools.delete_by_type", return_value=0):
             result = cleanup_document("missing-session")
         assert result["deleted_chunks"] == 0
 
@@ -330,7 +330,7 @@ class TestUploadEndpoint:
     def test_pdf_upload_success(self, client, engine, tmp_path):
         seed_user(engine, "analyst2", "analyst")
         token = get_token(client, "analyst2")
-        with patch("app.doc_qa.router.UPLOAD_DIR", tmp_path):
+        with patch("app.agents.doc_qa.router.UPLOAD_DIR", tmp_path):
             resp = client.post(
                 "/doc-qa/upload",
                 headers={"Authorization": f"Bearer {token}"},
@@ -346,7 +346,7 @@ class TestUploadEndpoint:
     def test_docx_upload_success(self, client, engine, tmp_path):
         seed_user(engine, "analyst3", "analyst")
         token = get_token(client, "analyst3")
-        with patch("app.doc_qa.router.UPLOAD_DIR", tmp_path):
+        with patch("app.agents.doc_qa.router.UPLOAD_DIR", tmp_path):
             resp = client.post(
                 "/doc-qa/upload",
                 headers={"Authorization": f"Bearer {token}"},
@@ -359,7 +359,7 @@ class TestUploadEndpoint:
         seed_user(engine, "analyst4", "analyst")
         token = get_token(client, "analyst4")
         big = b"x" * (21 * 1024 * 1024)
-        with patch("app.doc_qa.router.UPLOAD_DIR", tmp_path):
+        with patch("app.agents.doc_qa.router.UPLOAD_DIR", tmp_path):
             resp = client.post(
                 "/doc-qa/upload",
                 headers={"Authorization": f"Bearer {token}"},

@@ -150,12 +150,27 @@ On failure, raise an exception, the orchestrator catches it and reports `{"error
 
 ### Registering tools at startup
 
-Import the module containing your `@tool` functions in `app/main.py` for its side-effects:
+Place your tools in `app/agents/{agent_id}/tools.py` and they are discovered automatically. At startup, `discover_tools()` scans every `app/agents/*/tools.py` and imports it — no changes to `main.py` needed.
 
-```python
-# app/main.py
-import app.my_module.my_tools  # noqa: F401, registers tools on import
 ```
+app/
+└── agents/
+    ├── tools.py          ← platform built-ins (semantic_search, invoke_agent, …)
+    ├── doc_qa/
+    │   ├── tools.py      ← auto-discovered: @tool decorators registered
+    │   ├── router.py     ← auto-registered: must export APIRouter with prefix+tags
+    │   └── models.py     ← auto-imported: SQLModel table metadata registered
+    └── crm/
+        └── tools.py      ← only tools.py needed if no HTTP routes or DB tables
+```
+
+Three convention files — all optional except `tools.py` for tool-only agents:
+
+| File | Auto-loaded when | Requirement |
+|---|---|---|
+| `tools.py` | always | export `@tool`-decorated functions |
+| `router.py` | if present | export `router = APIRouter(prefix="…", tags=["…"])` |
+| `models.py` | if present | define `SQLModel` table classes |
 
 Tools are global — once registered, any agent that lists the tool name in its `tools:` YAML can call it.
 
@@ -368,16 +383,18 @@ Every agent run (success, error, timeout) writes a row to `agent_run_logs` via `
 
 ## Building a new agent — step by step
 
-### 1. Create the tool module
+### 1. Create the agent module
 
 ```
-app/my_feature/
+app/agents/my_agent/
     __init__.py
-    my_tools.py
+    tools.py          ← required; auto-discovered
+    router.py         ← optional; auto-registered if present
+    models.py         ← optional; auto-imported if present
 ```
 
 ```python
-# app/my_feature/my_tools.py
+# app/agents/my_agent/tools.py
 from app.agents.tools import tool
 
 @tool("my_tool", "Does the thing. Returns {result: str}.")
@@ -385,12 +402,9 @@ def my_tool(input_text: str) -> dict:
     return {"result": input_text.upper()}
 ```
 
-### 2. Register the module in main.py
+### 2. No registration needed — files are discovered automatically
 
-```python
-# app/main.py
-import app.my_feature.my_tools  # noqa: F401
-```
+`discover_tools()`, `discover_routers()`, and `discover_models()` scan `app/agents/*/` at startup. No changes to `main.py`.
 
 ### 3. If the tool is slow, add it to _LONG_RUNNING_TOOLS
 

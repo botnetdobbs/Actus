@@ -5,7 +5,7 @@ from pathlib import Path
 import structlog
 
 from app.agents.tools import tool
-from app.doc_qa.parser import MAX_CHUNKS, _chunk_text, extract_text
+from app.agents.doc_qa.parser import MAX_CHUNKS, _chunk_text, extract_text
 from app.rag.indexer import delete_by_type, index_text
 from app.rag.retriever import retrieve
 
