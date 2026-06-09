@@ -4,7 +4,7 @@ from sqlmodel import SQLModel
 from alembic import context
 
 # Register all table models so Alembic can detect the full schema
-import app.auth.models       # noqa: F401
+import app.auth.models       # noqa: F401  — also registers Team
 import app.ontology.models   # noqa: F401
 import app.agents.audit      # noqa: F401
 import app.context.store     # noqa: F401

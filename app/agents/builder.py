@@ -59,6 +59,8 @@ class AgentConfig(BaseModel):
     rag_top_k: int = Field(default=5, ge=1)
     schedule: AgentSchedule | None = None
     webhook: WebhookConfig | None = None
+    output_schema: dict | None = None
+    native_tools: bool | None = None
 
 
 _agents: dict[str, AgentConfig] = {}

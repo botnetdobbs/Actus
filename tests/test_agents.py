@@ -1,7 +1,7 @@
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from app.agents.orchestrator import extract_json, run_agent, _build_rag_query
+from app.agents.orchestrator import extract_json, run_agent, _build_rag_query, _MAX_SCHEMA_CORRECTIONS, _MAX_TOOL_RESULT_CHARS
 from app.agents.builder import AgentConfig
 from app.agents.tools import MAX_INVOKE_DEPTH, MAX_PARALLEL_AGENTS, ToolResult, _invoke_stack
 
@@ -489,3 +489,314 @@ def test_env_interpolation_nested_list(monkeypatch):
     monkeypatch.setenv("DB_URL", "postgres://localhost/db")
     result = _interpolate_env(["static", "${DB_URL}", 42])
     assert result == ["static", "postgres://localhost/db", 42]
+
+
+# ── Native tool calling ───────────────────────────────────────────────────────
+
+def test_supports_native_tools_non_ollama():
+    from app.agents.tools import _supports_native_tools
+    assert _supports_native_tools("openai/gpt-4o") is True
+    assert _supports_native_tools("anthropic/claude-sonnet-4-6") is True
+
+
+def test_supports_native_tools_ollama_false():
+    from app.agents.tools import _supports_native_tools
+    assert _supports_native_tools("ollama/mistral") is False
+    assert _supports_native_tools("ollama/llama3") is False
+
+
+def test_to_openai_tools_schema_conversion():
+    from app.agents.tools import to_openai_tools
+    schemas = [{
+        "name": "search",
+        "description": "Search documents",
+        "parameters": {
+            "query": {"type": "str", "required": True},
+            "top_k": {"type": "int", "required": False, "default": 5},
+        },
+    }]
+    result = to_openai_tools(schemas)
+    assert len(result) == 1
+    fn = result[0]
+    assert fn["type"] == "function"
+    assert fn["function"]["name"] == "search"
+    assert fn["function"]["parameters"]["properties"]["query"]["type"] == "string"
+    assert fn["function"]["parameters"]["properties"]["top_k"]["type"] == "integer"
+    assert "query" in fn["function"]["parameters"]["required"]
+    assert "top_k" not in fn["function"]["parameters"]["required"]
+
+
+def _native_done_response(content: str):
+    r = MagicMock()
+    r.choices[0].message.content = content
+    r.choices[0].message.tool_calls = []
+    r.usage.total_tokens = 100
+    r.usage.prompt_tokens = 60
+    r.usage.completion_tokens = 40
+    return r
+
+
+def _native_tool_response(tool_name: str, args: dict):
+    import json as _json
+    tc = MagicMock()
+    tc.id = "call_1"
+    tc.function.name = tool_name
+    tc.function.arguments = _json.dumps(args)
+    r = MagicMock()
+    r.choices[0].message.content = None
+    r.choices[0].message.tool_calls = [tc]
+    r.usage.total_tokens = 80
+    r.usage.prompt_tokens = 50
+    r.usage.completion_tokens = 30
+    return r
+
+
+@pytest.mark.asyncio
+async def test_native_done_no_tool_calls():
+    """In native mode, empty tool_calls → done; content is the final answer."""
+    with patch("app.agents.orchestrator.call_llm_with_retry",
+               AsyncMock(return_value=_native_done_response("Here is the answer"))), \
+         patch("app.agents.orchestrator.save_context"), \
+         patch("app.agents.orchestrator._supports_native_tools", return_value=True):
+        result = await run_agent(make_config(model="openai/gpt-4o", native_tools=True))
+    assert result["status"] == "completed"
+    assert result["result"] == "Here is the answer"
+    assert result["confidence"] is None  # no confidence wrapper in native mode
+
+
+@pytest.mark.asyncio
+async def test_native_tool_called_then_done():
+    """Native mode: tool_calls response → execute tool → done on next iteration."""
+    tool_response = _native_tool_response("search", {"query": "hello"})
+    done_response = _native_done_response("final answer after search")
+
+    with patch("app.agents.orchestrator.call_llm_with_retry",
+               AsyncMock(side_effect=[tool_response, done_response])), \
+         patch("app.agents.orchestrator.save_context"), \
+         patch("app.agents.orchestrator._supports_native_tools", return_value=True), \
+         patch("app.agents.orchestrator.run_tool",
+               AsyncMock(return_value=ToolResult(tool_name="search", success=True, output=["result1"]))):
+        result = await run_agent(make_config(model="openai/gpt-4o", native_tools=True,
+                                             max_iterations=3))
+    assert result["status"] == "completed"
+    assert len(result["tool_calls"]) == 1
+    assert result["tool_calls"][0]["tool"] == "search"
+
+
+@pytest.mark.asyncio
+async def test_native_unauthorised_tool_rejected():
+    """Native mode: tool_call for a tool not in config.tools is rejected."""
+    tool_response = _native_tool_response("forbidden_tool", {"x": 1})
+    done_response = _native_done_response("ok")
+
+    with patch("app.agents.orchestrator.call_llm_with_retry",
+               AsyncMock(side_effect=[tool_response, done_response])), \
+         patch("app.agents.orchestrator.save_context"), \
+         patch("app.agents.orchestrator._supports_native_tools", return_value=True):
+        result = await run_agent(make_config(model="openai/gpt-4o", native_tools=True,
+                                             tools=[], max_iterations=5))
+    assert result["tool_calls"][0]["detail"] == "unauthorised"
+
+
+# ── Output schema validation ──────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_output_schema_none_when_no_schema():
+    with patch("app.agents.orchestrator.call_llm_with_retry", AsyncMock(return_value=DONE)), \
+         patch("app.agents.orchestrator.save_context"):
+        result = await run_agent(make_config())
+    assert result["output_schema_valid"] is None
+
+
+@pytest.mark.asyncio
+async def test_output_schema_valid_on_conforming_result():
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
+    good_result_response = llm_response('{"done": true, "result": "{\\"answer\\": \\"yes\\"}"}')
+    with patch("app.agents.orchestrator.call_llm_with_retry",
+               AsyncMock(return_value=good_result_response)), \
+         patch("app.agents.orchestrator.save_context"):
+        result = await run_agent(make_config(output_schema=schema))
+    assert result["status"] == "completed"
+    assert result["output_schema_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_output_schema_invalid_triggers_correction_then_valid():
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
+    bad_result = llm_response('{"done": true, "result": "not json at all"}')
+    good_result = llm_response('{"done": true, "result": "{\\"answer\\": \\"yes\\"}"}')
+    with patch("app.agents.orchestrator.call_llm_with_retry",
+               AsyncMock(side_effect=[bad_result, good_result])), \
+         patch("app.agents.orchestrator.save_context"):
+        result = await run_agent(make_config(output_schema=schema, max_iterations=3))
+    assert result["status"] == "completed"
+    assert result["output_schema_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_output_schema_invalid_at_final_iteration_returns_false():
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
+    bad = llm_response('{"done": true, "result": "not json at all"}')
+    with patch("app.agents.orchestrator.call_llm_with_retry",
+               AsyncMock(return_value=bad)), \
+         patch("app.agents.orchestrator.save_context"):
+        result = await run_agent(make_config(output_schema=schema, max_iterations=1))
+    assert result["status"] == "completed"
+    assert result["output_schema_valid"] is False
+
+
+# ── Run trace ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_trace_included_in_result():
+    with patch("app.agents.orchestrator.call_llm_with_retry", AsyncMock(return_value=DONE)), \
+         patch("app.agents.orchestrator.save_context"):
+        result = await run_agent(make_config())
+    assert "trace" in result
+    assert isinstance(result["trace"], list)
+    assert len(result["trace"]) == 1
+    entry = result["trace"][0]
+    assert entry["iteration"] == 0
+    assert "llm_response" in entry
+    assert "messages_sent_count" in entry
+    assert "tokens_this_iteration" in entry
+
+
+# ── _cap_trace: embedded truncated flag ──────────────────────────────────────
+
+def test_cap_trace_embeds_truncated_false_when_small():
+    from app.agents.audit import _cap_trace
+    trace = [{"iteration": 0, "llm_response": "ok"}]
+    result = json.loads(_cap_trace(trace))
+    assert result["truncated"] is False
+    assert result["iterations"] == trace
+
+
+def test_cap_trace_embeds_truncated_true_when_over_limit():
+    from app.agents.audit import _cap_trace, _TRACE_SIZE_LIMIT
+    big_entry = {"iteration": 0, "tool_calls": ["x" * 1000], "tool_result": "y" * 1000}
+    # Build enough entries to exceed the limit
+    trace = [big_entry] * ((_TRACE_SIZE_LIMIT // 2000) + 5)
+    result = json.loads(_cap_trace(trace))
+    assert result["truncated"] is True
+    for entry in result["iterations"]:
+        assert "tool_calls" not in entry
+        assert "tool_result" not in entry
+
+
+# ── Native multi-tool trace captures all calls ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_native_multi_tool_trace_captures_all_calls():
+    import json as _json
+    tool_names = ["search", "lookup"]
+    tool_calls_list = []
+    for i, name in enumerate(tool_names):
+        tc = MagicMock()
+        tc.id = f"call_{i}"
+        tc.function.name = name
+        tc.function.arguments = _json.dumps({"q": f"query{i}"})
+        tool_calls_list.append(tc)
+
+    multi_tool_response = MagicMock()
+    multi_tool_response.choices[0].message.content = None
+    multi_tool_response.choices[0].message.tool_calls = tool_calls_list
+    multi_tool_response.usage.total_tokens = 80
+    multi_tool_response.usage.prompt_tokens = 50
+    multi_tool_response.usage.completion_tokens = 30
+
+    done_response = MagicMock()
+    done_response.choices[0].message.content = "all done"
+    done_response.choices[0].message.tool_calls = []
+    done_response.usage.total_tokens = 40
+    done_response.usage.prompt_tokens = 25
+    done_response.usage.completion_tokens = 15
+
+    with patch("app.agents.orchestrator.call_llm_with_retry",
+               AsyncMock(side_effect=[multi_tool_response, done_response])), \
+         patch("app.agents.orchestrator.save_context"), \
+         patch("app.agents.orchestrator._supports_native_tools", return_value=True), \
+         patch("app.agents.orchestrator.run_tool",
+               AsyncMock(return_value=ToolResult(tool_name="search", success=True, output="ok"))):
+        result = await run_agent(make_config(model="openai/gpt-4o", native_tools=True,
+                                             tools=["search", "lookup"], max_iterations=5))
+
+    assert result["status"] == "completed"
+    tool_iteration = result["trace"][0]
+    assert "tool_calls" in tool_iteration
+    assert len(tool_iteration["tool_calls"]) == 2
+    names = [tc["name"] for tc in tool_iteration["tool_calls"]]
+    assert "search" in names and "lookup" in names
+
+
+# ── Tool result truncation ────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_tool_result_truncated_at_limit():
+    big_output = "X" * (_MAX_TOOL_RESULT_CHARS + 500)
+    responses = [TOOL_CALL, DONE]
+    captured_messages: list = []
+
+    async def mock_llm(model, messages, **kwargs):
+        captured_messages.append(messages[:])
+        return responses.pop(0)
+
+    with patch("app.agents.orchestrator.call_llm_with_retry", side_effect=mock_llm), \
+         patch("app.agents.orchestrator.save_context"), \
+         patch("app.agents.orchestrator.run_tool",
+               AsyncMock(return_value=ToolResult(tool_name="search", success=True, output=big_output))):
+        result = await run_agent(make_config(max_iterations=3))
+
+    assert result["status"] == "completed"
+    # The tool result message sent to the LLM must be capped
+    tool_result_msg = next(
+        (m["content"] for msgs in captured_messages for m in msgs
+         if isinstance(m.get("content"), str) and "[truncated]" in m["content"]),
+        None,
+    )
+    assert tool_result_msg is not None, "Expected a truncated tool result message"
+
+
+# ── Schema correction budget ──────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_schema_correction_capped_at_max_corrections():
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
+    bad = llm_response('{"done": true, "result": "not valid json schema output"}')
+    # Supply _MAX_SCHEMA_CORRECTIONS bad results + more bad results beyond the cap
+    responses = [bad] * (_MAX_SCHEMA_CORRECTIONS + 3)
+    with patch("app.agents.orchestrator.call_llm_with_retry", AsyncMock(side_effect=responses)), \
+         patch("app.agents.orchestrator.save_context"):
+        result = await run_agent(make_config(output_schema=schema, max_iterations=20))
+    # After _MAX_SCHEMA_CORRECTIONS + 1 done signals, corrections are exhausted → returns completed
+    assert result["status"] == "completed"
+    assert result["output_schema_valid"] is False
+
+
+@pytest.mark.asyncio
+async def test_schema_errors_returned_on_invalid_result():
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
+    bad = llm_response('{"done": true, "result": "not json at all"}')
+    with patch("app.agents.orchestrator.call_llm_with_retry", AsyncMock(return_value=bad)), \
+         patch("app.agents.orchestrator.save_context"):
+        result = await run_agent(make_config(output_schema=schema, max_iterations=1))
+    assert result["output_schema_valid"] is False
+    assert result["output_schema_errors"] is not None
+    assert len(result["output_schema_errors"]) > 0
+
+
+# ── Run trace ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_trace_has_tool_call_entry():
+    with patch("app.agents.orchestrator.call_llm_with_retry",
+               AsyncMock(side_effect=[TOOL_CALL, DONE])), \
+         patch("app.agents.orchestrator.save_context"), \
+         patch("app.agents.orchestrator.run_tool",
+               AsyncMock(return_value=ToolResult(tool_name="search", success=True, output="results"))):
+        result = await run_agent(make_config(max_iterations=3))
+    assert len(result["trace"]) == 2  # tool call iteration + done iteration
+    # tool_calls is now a list of calls per iteration
+    assert "tool_calls" in result["trace"][0]
+    assert len(result["trace"][0]["tool_calls"]) == 1
+    assert result["trace"][0]["tool_calls"][0]["name"] == "search"

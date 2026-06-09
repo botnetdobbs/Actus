@@ -1,4 +1,3 @@
-import warnings
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import model_validator
 from functools import lru_cache
@@ -24,6 +23,8 @@ class Settings(BaseSettings):
     llm_retry_base_delay: float = 1.0
     # RAG
     embedding_model: str = "all-MiniLM-L6-v2"
+    # Redis pub/sub for cross-process SSE fan-out; falls back to DB polling if empty
+    redis_url: str = ""
 
     @model_validator(mode="after")
     def validate_production_settings(self) -> "Settings":
@@ -33,10 +34,9 @@ class Settings(BaseSettings):
             if len(self.secret_key) < 32:
                 raise ValueError("SECRET_KEY must be at least 32 characters")
             if "*" in self.cors_origins:
-                warnings.warn(
-                    "CORS_ORIGINS contains '*' — all origins are permitted. "
-                    "Set CORS_ORIGINS to your actual domain(s) in production.",
-                    stacklevel=2,
+                raise ValueError(
+                    "CORS_ORIGINS is '*' — set it to your actual domain(s) in production, "
+                    "e.g. CORS_ORIGINS=https://app.example.com"
                 )
         return self
 

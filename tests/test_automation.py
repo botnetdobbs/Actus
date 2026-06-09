@@ -125,30 +125,33 @@ def test_stream_already_completed(client, engine):
     assert f'"id":{wf_id}' in body
 
 
-def test_stream_live_queue_emits_per_iteration_events(client, engine):
-    from app.automation.router import _run_queues
+def test_stream_redis_emits_per_iteration_events(client, engine):
+    """SSE via Redis pub/sub: mock subscribe_workflow to yield pre-baked events."""
+    from collections.abc import AsyncGenerator
 
     seed_user(engine, "astream_live", "analyst")
     token = get_token(client, "astream_live")
     wf_id = seed_workflow(engine, "test-agent", "running")
 
-    queue: asyncio.Queue = asyncio.Queue()
-    queue.put_nowait({"type": "iteration_start", "run_id": "r1", "iteration": 0})
-    queue.put_nowait({"type": "tool_call", "run_id": "r1", "iteration": 0,
-                      "tool": "my_tool", "args": {}})
-    queue.put_nowait({"type": "tool_result", "run_id": "r1", "iteration": 0,
-                      "tool": "my_tool", "success": True, "preview": "{}"})
-    queue.put_nowait({"type": "done", "run_id": "r1", "status": "completed",
-                      "result": "all good", "iterations": 1, "total_tokens": 100})
-    queue.put_nowait(None)  # sentinel
-    _run_queues[wf_id] = queue
+    events = [
+        {"type": "iteration_start", "run_id": "r1", "iteration": 0},
+        {"type": "tool_call", "run_id": "r1", "iteration": 0,
+         "tool": "my_tool", "args": {}},
+        {"type": "tool_result", "run_id": "r1", "iteration": 0,
+         "tool": "my_tool", "success": True, "preview": "{}"},
+        {"type": "done", "run_id": "r1", "status": "completed",
+         "result": "all good", "iterations": 1, "total_tokens": 100},
+    ]
 
-    try:
+    async def fake_subscribe(channel: str) -> AsyncGenerator[dict, None]:
+        for e in events:
+            yield e
+
+    with patch("app.automation.router.pubsub.is_available", return_value=True), \
+         patch("app.automation.router.pubsub.subscribe_workflow", side_effect=fake_subscribe):
         with client.stream("GET", f"/automation/workflows/{wf_id}/stream",
                            headers=auth_header(token)) as resp:
             body = resp.read().decode()
-    finally:
-        _run_queues.pop(wf_id, None)
 
     assert "iteration_start" in body
     assert "tool_call" in body
@@ -159,13 +162,11 @@ def test_stream_live_queue_emits_per_iteration_events(client, engine):
 
 def test_stream_db_poll_fallback_detects_transition(client, engine):
     """DB polling fallback: detects running→completed transition and emits full payload."""
-    from unittest.mock import patch, AsyncMock
-    from app.automation.router import _run_queues
+    from unittest.mock import patch
 
     seed_user(engine, "astream_poll", "analyst")
     token = get_token(client, "astream_poll")
     wf_id = seed_workflow(engine, "test-agent", "running")
-    assert wf_id not in _run_queues
 
     flipped = [False]
 
@@ -178,7 +179,9 @@ def test_stream_db_poll_fallback_detects_transition(client, engine):
                 session.add(wf)
                 session.commit()
 
-    with patch("app.automation.router.asyncio.sleep", side_effect=flip_on_first_sleep):
+    # Redis not available → falls through to DB polling path
+    with patch("app.automation.router.pubsub.is_available", return_value=False), \
+         patch("app.automation.router.asyncio.sleep", side_effect=flip_on_first_sleep):
         with client.stream("GET", f"/automation/workflows/{wf_id}/stream",
                            headers=auth_header(token)) as resp:
             body = resp.read().decode()
@@ -714,3 +717,280 @@ def test_admin_sees_all_runs(client, engine):
     resp = client.get("/automation/runs", headers=auth_header(token_admin))
     assert resp.status_code == 200
     assert len(resp.json()) == 2
+
+
+# ── Run trace endpoint ────────────────────────────────────────────────────────
+
+def seed_run_with_trace(engine, triggered_by: int | None = None, trace: list | None = None) -> str:
+    import json as _json
+    run_id = str(uuid.uuid4())
+    with Session(engine) as session:
+        entry = AgentRunLog(
+            run_id=run_id,
+            agent_id="test-agent",
+            triggered_by=triggered_by,
+            started_at=datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc),
+            completed_at=datetime(2026, 1, 1, 10, 0, 30, tzinfo=timezone.utc),
+            outcome="success",
+            trace_json=_json.dumps(trace) if trace is not None else None,
+        )
+        session.add(entry)
+        session.commit()
+    return run_id
+
+
+def test_trace_endpoint_requires_auth(client, engine):
+    run_id = seed_run_with_trace(engine)
+    resp = client.get(f"/automation/runs/{run_id}/trace")
+    assert resp.status_code == 401
+
+
+def test_trace_endpoint_not_found(client, engine):
+    seed_user(engine, "trace_analyst", "analyst")
+    token = get_token(client, "trace_analyst")
+    resp = client.get("/automation/runs/no-such-run/trace", headers=auth_header(token))
+    assert resp.status_code == 404
+
+
+def test_trace_endpoint_no_trace(client, engine):
+    user = seed_user(engine, "trace_none", "analyst")
+    token = get_token(client, "trace_none")
+    run_id = seed_run_with_trace(engine, triggered_by=user.id, trace=None)
+    resp = client.get(f"/automation/runs/{run_id}/trace", headers=auth_header(token))
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trace_available"] is False
+    assert data["iterations"] == []
+
+
+def test_trace_endpoint_returns_iterations(client, engine):
+    user = seed_user(engine, "trace_full", "analyst")
+    token = get_token(client, "trace_full")
+    trace = [
+        {"iteration": 0, "messages_sent_count": 2, "llm_response": "thinking...",
+         "tokens_this_iteration": 80, "system_prompt_preview": "you are an agent"},
+        {"iteration": 1, "messages_sent_count": 4, "llm_response": '{"done": true}',
+         "tokens_this_iteration": 60, "system_prompt_preview": "you are an agent"},
+    ]
+    run_id = seed_run_with_trace(engine, triggered_by=user.id, trace=trace)
+    resp = client.get(f"/automation/runs/{run_id}/trace", headers=auth_header(token))
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trace_available"] is True
+    assert data["total_iterations"] == 2
+    assert data["truncated"] is False
+    assert len(data["iterations"]) == 2
+
+
+def test_trace_endpoint_analyst_cannot_see_others_trace(client, engine):
+    user1 = seed_user(engine, "trace_own", "analyst")
+    user2 = seed_user(engine, "trace_other", "analyst")
+    token1 = get_token(client, "trace_own")
+    run_id = seed_run_with_trace(engine, triggered_by=user2.id, trace=[])
+    resp = client.get(f"/automation/runs/{run_id}/trace", headers=auth_header(token1))
+    assert resp.status_code == 404
+
+
+# ── By-ID visibility (IDOR prevention) ───────────────────────────────────────
+
+def _create_two_teams(engine, user1_id: int, user2_id: int,
+                      name_a: str, name_b: str) -> tuple[int, int]:
+    """Create two teams, assign user1 to team_a and user2 to team_b. Return (team_a_id, team_b_id)."""
+    from app.auth.models import Team, User as AuthUser
+    with Session(engine) as session:
+        team_a = Team(name=name_a, created_by=user1_id)
+        team_b = Team(name=name_b, created_by=user2_id)
+        session.add(team_a)
+        session.add(team_b)
+        session.commit()
+        session.refresh(team_a)
+        session.refresh(team_b)
+        team_a_id = team_a.id
+        team_b_id = team_b.id
+        u1 = session.get(AuthUser, user1_id)
+        u2 = session.get(AuthUser, user2_id)
+        u1.team_id = team_a_id
+        u2.team_id = team_b_id
+        session.add(u1)
+        session.add(u2)
+        session.commit()
+    return team_a_id, team_b_id
+
+
+def test_get_workflow_wrong_team_returns_404(client, engine):
+    user1 = seed_user(engine, "idor_wf_u1", "analyst")
+    user2 = seed_user(engine, "idor_wf_u2", "analyst")
+    user1_id = user1.id
+    user2_id = user2.id
+    token1 = get_token(client, "idor_wf_u1")
+
+    _, team_b_id = _create_two_teams(engine, user1_id, user2_id, "TeamA_idor", "TeamB_idor")
+
+    wf_id = seed_workflow_full(engine, created_by=user2_id, status="completed")
+    with Session(engine) as session:
+        wf = session.get(Workflow, wf_id)
+        wf.team_id = team_b_id
+        session.add(wf)
+        session.commit()
+
+    resp = client.get(f"/automation/workflows/{wf_id}", headers=auth_header(token1))
+    assert resp.status_code == 404
+
+
+def test_get_run_wrong_team_returns_404(client, engine):
+    from app.agents.audit import AgentRunLog
+    from sqlmodel import select as sa_select
+    user1 = seed_user(engine, "idor_run_u1", "analyst")
+    user2 = seed_user(engine, "idor_run_u2", "analyst")
+    user1_id = user1.id
+    user2_id = user2.id
+    token1 = get_token(client, "idor_run_u1")
+
+    _, team_d_id = _create_two_teams(engine, user1_id, user2_id, "TeamC_idor", "TeamD_idor")
+
+    run_id = seed_run_log(engine, triggered_by=user2_id)
+    with Session(engine) as session:
+        run = session.exec(sa_select(AgentRunLog).where(AgentRunLog.run_id == run_id)).first()
+        run.team_id = team_d_id
+        session.add(run)
+        session.commit()
+
+    resp = client.get(f"/automation/runs/{run_id}", headers=auth_header(token1))
+    assert resp.status_code == 404
+
+
+def test_stream_wrong_team_yields_error_event(client, engine):
+    user1 = seed_user(engine, "idor_stream_u1", "analyst")
+    user2 = seed_user(engine, "idor_stream_u2", "analyst")
+    user1_id = user1.id
+    user2_id = user2.id
+    token1 = get_token(client, "idor_stream_u1")
+
+    _, team_f_id = _create_two_teams(engine, user1_id, user2_id, "TeamE_idor", "TeamF_idor")
+
+    wf_id = seed_workflow_full(engine, created_by=user2_id, status="running")
+    with Session(engine) as session:
+        wf = session.get(Workflow, wf_id)
+        wf.team_id = team_f_id
+        session.add(wf)
+        session.commit()
+
+    with client.stream("GET", f"/automation/workflows/{wf_id}/stream",
+                       headers=auth_header(token1)) as resp:
+        body = resp.read().decode()
+    assert '"type": "error"' in body
+
+
+# ── Trace format backward compat ──────────────────────────────────────────────
+
+def test_trace_endpoint_handles_old_list_format(client, engine):
+    """Old trace_json stored as a plain list — backward compat must still work."""
+    import json as _json
+    user = seed_user(engine, "trace_compat", "analyst")
+    token = get_token(client, "trace_compat")
+    old_format_trace = [
+        {"iteration": 0, "tool_call": {"name": "search"}, "tool_result": {"success": True}},
+    ]
+    run_id = seed_run_with_trace(engine, triggered_by=user.id, trace=old_format_trace)
+    resp = client.get(f"/automation/runs/{run_id}/trace", headers=auth_header(token))
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["trace_available"] is True
+    assert data["total_iterations"] == 1
+    assert data["truncated"] is False
+
+
+def test_run_response_does_not_include_ip_address(client, engine):
+    seed_user(engine, "no_ip", "analyst")
+    token = get_token(client, "no_ip")
+    seed_run_log(engine)
+    resp = client.get("/automation/runs", headers=auth_header(token))
+    assert resp.status_code == 200
+    assert len(resp.json()) > 0
+    assert "ip_address" not in resp.json()[0]
+
+
+# ── Team management ───────────────────────────────────────────────────────────
+
+def test_create_team_requires_admin(client, engine):
+    seed_user(engine, "team_analyst", "analyst")
+    token = get_token(client, "team_analyst")
+    resp = client.post("/auth/teams", json={"name": "Engineering"},
+                       headers=auth_header(token))
+    assert resp.status_code == 403
+
+
+def test_create_team_success(client, engine):
+    seed_user(engine, "team_admin", "admin")
+    token = get_token(client, "team_admin")
+    resp = client.post("/auth/teams", json={"name": "Engineering"},
+                       headers=auth_header(token))
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["name"] == "Engineering"
+    assert data["id"] is not None
+
+
+def test_create_team_duplicate_name(client, engine):
+    seed_user(engine, "team_admin2", "admin")
+    token = get_token(client, "team_admin2")
+    client.post("/auth/teams", json={"name": "Sales"}, headers=auth_header(token))
+    resp = client.post("/auth/teams", json={"name": "Sales"}, headers=auth_header(token))
+    assert resp.status_code == 409
+
+
+def test_list_teams_requires_admin(client, engine):
+    seed_user(engine, "team_viewer", "viewer")
+    token = get_token(client, "team_viewer")
+    resp = client.get("/auth/teams", headers=auth_header(token))
+    assert resp.status_code == 403
+
+
+def test_list_teams(client, engine):
+    seed_user(engine, "team_adm_list", "admin")
+    token = get_token(client, "team_adm_list")
+    client.post("/auth/teams", json={"name": "Alpha"}, headers=auth_header(token))
+    client.post("/auth/teams", json={"name": "Beta"}, headers=auth_header(token))
+    resp = client.get("/auth/teams", headers=auth_header(token))
+    assert resp.status_code == 200
+    names = [t["name"] for t in resp.json()]
+    assert "Alpha" in names and "Beta" in names
+
+
+def test_assign_team_to_user(client, engine):
+    admin = seed_user(engine, "team_adm_assign", "admin")
+    analyst = seed_user(engine, "team_user_assign", "analyst")
+    token = get_token(client, "team_adm_assign")
+    # create team
+    resp = client.post("/auth/teams", json={"name": "Ops"}, headers=auth_header(token))
+    team_id = resp.json()["id"]
+    # assign user
+    resp = client.patch(f"/auth/users/{analyst.id}/team",
+                        json={"team_id": team_id}, headers=auth_header(token))
+    assert resp.status_code == 200
+    assert resp.json()["team_id"] == team_id
+
+
+def test_assign_team_nonexistent_team(client, engine):
+    admin = seed_user(engine, "team_adm_bad", "admin")
+    analyst = seed_user(engine, "team_user_bad", "analyst")
+    token = get_token(client, "team_adm_bad")
+    resp = client.patch(f"/auth/users/{analyst.id}/team",
+                        json={"team_id": 99999}, headers=auth_header(token))
+    assert resp.status_code == 404
+
+
+def test_remove_team_from_user(client, engine):
+    admin = seed_user(engine, "team_adm_rem", "admin")
+    analyst = seed_user(engine, "team_user_rem", "analyst")
+    token = get_token(client, "team_adm_rem")
+    # create and assign
+    resp = client.post("/auth/teams", json={"name": "Finance"}, headers=auth_header(token))
+    team_id = resp.json()["id"]
+    client.patch(f"/auth/users/{analyst.id}/team",
+                 json={"team_id": team_id}, headers=auth_header(token))
+    # remove
+    resp = client.patch(f"/auth/users/{analyst.id}/team",
+                        json={"team_id": None}, headers=auth_header(token))
+    assert resp.status_code == 200
+    assert resp.json()["team_id"] is None

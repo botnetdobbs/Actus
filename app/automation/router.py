@@ -8,6 +8,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import Session, select
+from sqlalchemy.orm import defer as sa_defer
 from app.agents.audit import AgentRunLog, AgentRunLogResponse, log_agent_run
 from app.agents.builder import get_agent, list_agents, reload_agents
 from app.agents.orchestrator import run_agent_with_timeout
@@ -16,6 +17,7 @@ from app.auth.jwt import require_role, write_audit_log
 from app.context.models import Workflow, WorkflowStatus
 from app.database import get_engine, get_session
 from app.limiter import limiter
+from app import pubsub
 import structlog
 
 log = structlog.get_logger()
@@ -56,21 +58,69 @@ class WorkflowResponse(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     created_by: int | None
+    team_id: int | None = None
     extra_context_json: str | None
 
 
-# keyed by workflow_id; holds the live event queue for an in-progress run on this process
-_run_queues: dict[int, asyncio.Queue] = {}
+class AgentRunTrace(BaseModel):
+    run_id: str
+    agent_id: str | None
+    trace_available: bool
+    total_iterations: int
+    truncated: bool
+    iterations: list[dict]
+
+
+def _apply_visibility(query, user: User, *, team_col, owner_col):
+    """Scope a query to records the user is allowed to see.
+
+    - Users in a team: see own team's records + team-less global records (NULL team)
+    - Users without a team (non-admin): see own records + unowned webhook/scheduled records
+    - Global admin (no team): see everything
+    """
+    if user.team_id is not None:
+        return query.where((team_col == user.team_id) | (team_col == None))  # noqa: E711
+    if user.role != "admin":
+        return query.where((owner_col == user.id) | (owner_col == None))  # noqa: E711
+    return query  # global admin: see all
+
+
+def _check_visibility(record, user: User, *, team_id_attr: str, owner_id_attr: str) -> bool:
+    """Single source of truth for by-ID access control. Mirrors _apply_visibility logic."""
+    record_team = getattr(record, team_id_attr, None)
+    record_owner = getattr(record, owner_id_attr, None)
+    if user.team_id is not None:
+        return record_team == user.team_id or record_team is None
+    if user.role == "admin":
+        return True
+    return record_owner == user.id or record_owner is None
+
+
+async def _forward_to_redis(queue: asyncio.Queue, channel: str) -> None:
+    """Read events from a local asyncio.Queue and publish them to Redis."""
+    while True:
+        try:
+            event = await queue.get()
+        except Exception:
+            break
+        if event is None:
+            # End-of-stream sentinel — publish sse_end and stop
+            await pubsub.publish_event(channel, {"type": "sse_end"})
+            break
+        await pubsub.publish_event(channel, event)
 
 
 async def _run_workflow(workflow_id: int, triggered_by: int | None, ip_address: str | None) -> None:
     queue: asyncio.Queue = asyncio.Queue()
-    _run_queues[workflow_id] = queue
+    channel = f"workflow:{workflow_id}"
+    forwarder = asyncio.create_task(_forward_to_redis(queue, channel))
 
     started_at = datetime.now(timezone.utc)
     with Session(get_engine()) as session:
         wf = session.get(Workflow, workflow_id)
-        assert wf is not None
+        if wf is None:
+            log.error("workflow_not_found_in_background", workflow_id=workflow_id)
+            return
         wf.status = WorkflowStatus.running
         wf.started_at = started_at
         session.add(wf)
@@ -78,6 +128,7 @@ async def _run_workflow(workflow_id: int, triggered_by: int | None, ip_address: 
         session.refresh(wf)
         agent_id = wf.agent_id
         extra_context_json = wf.extra_context_json
+        wf_team_id = wf.team_id
 
     status = WorkflowStatus.failed
     outcome = "error"
@@ -94,10 +145,15 @@ async def _run_workflow(workflow_id: int, triggered_by: int | None, ip_address: 
         error = str(e)
         log.error("workflow_failed", workflow_id=workflow_id, agent_id=agent_id, error=error)
     finally:
-        _run_queues.pop(workflow_id, None)
+        try:
+            await forwarder  # ensure all events are forwarded before writing final DB state
+        except Exception as fwd_exc:
+            log.warning("forwarder_task_failed", workflow_id=workflow_id, error=str(fwd_exc))
         with Session(get_engine()) as session:
             wf = session.get(Workflow, workflow_id)
-            assert wf is not None
+            if wf is None:
+                log.error("workflow_not_found_on_finalize", workflow_id=workflow_id)
+                return
             wf.status = status
             wf.completed_at = datetime.now(timezone.utc)
             wf.result_json = json.dumps(result) if result else None
@@ -121,8 +177,10 @@ async def _run_workflow(workflow_id: int, triggered_by: int | None, ip_address: 
             tool_calls=result.get("tool_calls") if result else None,
             agent_id=agent_id,
             triggered_by=triggered_by,
+            team_id=wf_team_id,
             result_summary=summary,
             ip_address=ip_address,
+            trace=result.get("trace") if result else None,
         )
 
 
@@ -147,6 +205,7 @@ async def trigger_agent(
             name=config.name,
             agent_id=agent_id,
             created_by=user.id,
+            team_id=user.team_id,
             extra_context_json=json.dumps(body.extra_context) if body and body.extra_context else None,
         )
         session.add(wf)
@@ -212,6 +271,7 @@ async def webhook_trigger(
             name=config.name,
             agent_id=agent_id,
             created_by=None,
+            team_id=None,  # webhook runs are global / unscoped
             extra_context_json=json.dumps(extra_context) if extra_context else None,
         )
         session.add(wf)
@@ -246,10 +306,7 @@ async def list_workflows(
     user: User = Depends(require_role("analyst")),
 ):
     query = select(Workflow)
-    if user.role != "admin":
-        query = query.where(
-            (Workflow.created_by == user.id) | (Workflow.created_by == None)  # noqa: E711
-        )
+    query = _apply_visibility(query, user, team_col=Workflow.team_id, owner_col=Workflow.created_by)
     if agent_id:
         query = query.where(Workflow.agent_id == agent_id)
     if status:
@@ -265,9 +322,7 @@ async def get_workflow(
     user: User = Depends(require_role("analyst")),
 ):
     wf = session.get(Workflow, workflow_id)
-    if not wf:
-        raise HTTPException(status_code=404, detail=f"Workflow {workflow_id} not found")
-    if user.role != "admin" and wf.created_by is not None and wf.created_by != user.id:
+    if not wf or not _check_visibility(wf, user, team_id_attr="team_id", owner_id_attr="created_by"):
         raise HTTPException(status_code=404, detail=f"Workflow {workflow_id} not found")
     return wf
 
@@ -276,72 +331,62 @@ async def get_workflow(
 async def stream_workflow(
     workflow_id: int,
     request: Request,
-    _: User = Depends(require_role("analyst")),
+    user: User = Depends(require_role("analyst")),
 ):
     _TERMINAL = {WorkflowStatus.completed, WorkflowStatus.failed, WorkflowStatus.timeout}
 
     async def sse_generator():
-        # Emit current status immediately from DB — fast first event, captures values inside session
+        # Emit current status immediately from DB; also enforce visibility
         with Session(get_engine()) as session:
             db_wf = session.get(Workflow, workflow_id)
-            if db_wf is None:
-                found = False
-                wf_status = None
-                terminal_payload = None
-            else:
-                found = True
-                wf_status = db_wf.status
-                terminal_payload = (WorkflowResponse.model_validate(db_wf).model_dump_json()
-                                    if wf_status in _TERMINAL else None)
+            if db_wf is None or not _check_visibility(
+                db_wf, user, team_id_attr="team_id", owner_id_attr="created_by"
+            ):
+                yield 'data: {"type": "error", "error": "Not found"}\n\n'
+                return
+            wf_status = db_wf.status
+            terminal_payload = (WorkflowResponse.model_validate(db_wf).model_dump_json()
+                                if wf_status in _TERMINAL else None)
 
-        if not found:
-            yield 'data: {"type": "error", "error": "Not found"}\n\n'
-            return
-
-        assert wf_status is not None
         yield f'data: {{"type": "status", "status": "{wf_status.value}", "workflow_id": {workflow_id}}}\n\n'
 
         if wf_status in _TERMINAL:
             yield f"data: {terminal_payload}\n\n"
             return
 
-        # Try live queue (per-iteration events) — falls back to DB polling if absent
-        queue = _run_queues.get(workflow_id)
-        if queue is not None:
-            while True:
+        # Try Redis pub/sub (cross-process, fan-out) — falls back to DB polling if unavailable
+        channel = f"workflow:{workflow_id}"
+        if pubsub.is_available():
+            async for event in pubsub.subscribe_workflow(channel):
                 if await request.is_disconnected():
-                    break
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
-                    continue
-                if event is None:  # sentinel — run_agent finally block guarantees this fires
                     break
                 yield f"data: {json.dumps(event)}\n\n"
                 if event.get("type") == "done":
                     break
-            # Emit final durable result from DB
-            with Session(get_engine()) as session:
-                db_wf = session.get(Workflow, workflow_id)
-                final_payload = (WorkflowResponse.model_validate(db_wf).model_dump_json()
-                                 if db_wf is not None else None)
-            if final_payload:
-                yield f"data: {final_payload}\n\n"
-        else:
-            # Fallback: DB polling for reconnect / LB failover / already-done without queue
-            last_status = wf_status
-            while True:
-                if await request.is_disconnected():
-                    break
-                await asyncio.sleep(1)
+            if not await request.is_disconnected():
+                # Emit final durable result from DB
                 with Session(get_engine()) as session:
                     db_wf = session.get(Workflow, workflow_id)
-                    if db_wf is None:
-                        break
-                    curr_status = db_wf.status
-                    curr_payload = (WorkflowResponse.model_validate(db_wf).model_dump_json()
-                                    if curr_status in _TERMINAL else None)
+                    final_payload = (WorkflowResponse.model_validate(db_wf).model_dump_json()
+                                     if db_wf is not None else None)
+                if final_payload:
+                    yield f"data: {final_payload}\n\n"
+            return
+
+        # Fallback: DB polling — single session held for duration to avoid pool exhaustion
+        last_status = wf_status
+        with Session(get_engine()) as session:
+            while True:
+                await asyncio.sleep(1)
+                if await request.is_disconnected():
+                    break
+                session.expire_all()  # bypass identity map; force fresh DB read
+                db_wf = session.get(Workflow, workflow_id)
+                if db_wf is None:
+                    break
+                curr_status = db_wf.status
+                curr_payload = (WorkflowResponse.model_validate(db_wf).model_dump_json()
+                                if curr_status in _TERMINAL else None)
                 if curr_status != last_status:
                     last_status = curr_status
                     if curr_status in _TERMINAL:
@@ -371,11 +416,8 @@ async def list_runs(
     session: Session = Depends(get_session),
     user: User = Depends(require_role("analyst")),
 ):
-    query = select(AgentRunLog)
-    if user.role != "admin":
-        query = query.where(
-            (AgentRunLog.triggered_by == user.id) | (AgentRunLog.triggered_by == None)  # noqa: E711
-        )
+    query = select(AgentRunLog).options(sa_defer(AgentRunLog.trace_json))
+    query = _apply_visibility(query, user, team_col=AgentRunLog.team_id, owner_col=AgentRunLog.triggered_by)
     if agent_id:
         query = query.where(AgentRunLog.agent_id == agent_id)
     if outcome:
@@ -397,11 +439,55 @@ async def get_run(
     user: User = Depends(require_role("analyst")),
 ):
     run = session.exec(select(AgentRunLog).where(AgentRunLog.run_id == run_id)).first()
-    if not run:
-        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
-    if user.role != "admin" and run.triggered_by is not None and run.triggered_by != user.id:
+    if not run or not _check_visibility(run, user, team_id_attr="team_id", owner_id_attr="triggered_by"):
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
     return run
+
+
+@router.get("/runs/{run_id}/trace", response_model=AgentRunTrace)
+async def get_run_trace(
+    run_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_role("analyst")),
+):
+    run = session.exec(select(AgentRunLog).where(AgentRunLog.run_id == run_id)).first()
+    if not run or not _check_visibility(run, user, team_id_attr="team_id", owner_id_attr="triggered_by"):
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+
+    if run.trace_json is None:
+        return AgentRunTrace(
+            run_id=run_id,
+            agent_id=run.agent_id,
+            trace_available=False,
+            total_iterations=0,
+            truncated=False,
+            iterations=[],
+        )
+
+    try:
+        trace_data = json.loads(run.trace_json)
+    except (json.JSONDecodeError, ValueError):
+        trace_data = []
+
+    # Backward compat: old format stored a plain list; new format is {"truncated": bool, "iterations": [...]}
+    if isinstance(trace_data, list):
+        iterations = trace_data
+        truncated = any(
+            "tool_call" in entry and "tool_result" not in entry
+            for entry in iterations
+        )
+    else:
+        iterations = trace_data.get("iterations", [])
+        truncated = trace_data.get("truncated", False)
+
+    return AgentRunTrace(
+        run_id=run_id,
+        agent_id=run.agent_id,
+        trace_available=True,
+        total_iterations=len(iterations),
+        truncated=truncated,
+        iterations=iterations,
+    )
 
 
 # ── Reload agents ─────────────────────────────────────────────────────────────

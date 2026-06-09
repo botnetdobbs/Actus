@@ -58,4 +58,5 @@ class Workflow(SQLModel, table=True):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     created_by: int | None = None
+    team_id: int | None = None
     extra_context_json: str | None = None

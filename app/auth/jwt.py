@@ -5,7 +5,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlmodel import Session, select
 from app.config import get_settings
 from app.database import get_engine, get_session
-from app.auth.models import User, AuditLog
+from app.auth.models import User, AuditLog, VALID_ROLES
 import structlog
 
 log = structlog.get_logger()
@@ -48,11 +48,13 @@ async def get_current_user(
     return user
 
 
+_ROLES_HIERARCHY: dict[str, int] = {"viewer": 0, "analyst": 1, "admin": 2}
+
+
 def require_role(role: str):
     async def checker(user: User = Depends(get_current_user)):
-        roles_hierarchy = {"viewer": 0, "analyst": 1, "admin": 2}
-        required = roles_hierarchy.get(role, 99)
-        actual = roles_hierarchy.get(user.role, 0)
+        required = _ROLES_HIERARCHY.get(role, 99)
+        actual = _ROLES_HIERARCHY.get(user.role, 0)
         if actual < required:
             raise HTTPException(status_code=403, detail=f"Role '{role}' required")
         return user

@@ -1,0 +1,28 @@
+agent_id: customer_analyst
+description: Churn risk identification and analysis
+cases:
+  - id: basic_churn_identification
+    description: Identifies at-risk customers from payment data
+    input:
+      extra_context:
+        customers:
+          - {id: 1, name: Alice, missed_payments: 2, tenure_months: 6}
+          - {id: 2, name: Bob, missed_payments: 0, tenure_months: 24}
+          - {id: 3, name: Carol, missed_payments: 3, tenure_months: 3}
+    assertions:
+      - {type: status, value: completed}
+      - {type: result_contains, value: "Alice"}
+      - {type: result_not_contains, value: "error"}
+      - {type: max_tokens, value: 8000}
+    timeout_seconds: 90
+
+  - id: schema_validation
+    description: Result conforms to output_schema if configured
+    input:
+      extra_context:
+        customers:
+          - {id: 1, name: Dave, missed_payments: 1, tenure_months: 12}
+    assertions:
+      - {type: status, value: completed}
+      - {type: schema_valid}
+    timeout_seconds: 90

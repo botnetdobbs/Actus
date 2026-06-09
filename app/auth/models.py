@@ -2,7 +2,20 @@ from datetime import datetime, timezone
 from typing import ClassVar
 from sqlalchemy import DateTime as SADateTime, Column
 from sqlmodel import SQLModel, Field
+from pydantic import model_validator
 import bcrypt as _bcrypt
+
+VALID_ROLES: frozenset[str] = frozenset({"viewer", "analyst", "admin"})
+
+
+class Team(SQLModel, table=True):
+    __tablename__: ClassVar[str] = "teams"  # pyright: ignore[reportIncompatibleVariableOverride]
+
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field(unique=True, index=True)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_by: int | None = None
+    is_deleted: bool = False
 
 
 class User(SQLModel, table=True):
@@ -13,6 +26,7 @@ class User(SQLModel, table=True):
     hashed_password: str
     role: str = "viewer"
     is_active: bool = True
+    team_id: int | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_login: datetime | None = Field(
@@ -25,6 +39,12 @@ class User(SQLModel, table=True):
     is_deleted: bool = Field(default=False, index=True)
     deleted_at: datetime | None = None
     deleted_by: int | None = None
+
+    @model_validator(mode="after")
+    def _validate_role(self) -> "User":
+        if self.role not in VALID_ROLES:
+            raise ValueError(f"role must be one of {sorted(VALID_ROLES)}, got '{self.role}'")
+        return self
 
     def touch(self) -> None:
         self.updated_at = datetime.now(timezone.utc)

@@ -42,7 +42,12 @@ def _clean_annotation(annotation) -> str:
     return str(annotation).replace("typing.", "").replace("builtins.", "")
 
 
-def tool(name: str, description: str):
+def tool(name: str, description: str, *, params: dict[str, str] | None = None):
+    """Register a callable as an agent tool.
+
+    params: optional mapping of parameter name → description, included in
+    OpenAI function-calling schema so the model understands each argument's purpose.
+    """
     def decorator(fn: Callable):
         _tools[name] = fn
         _tool_descriptions[name] = description
@@ -52,20 +57,23 @@ def tool(name: str, description: str):
         except Exception:
             hints = {}
 
-        params = {}
+        params_dict: dict[str, dict] = {}
         for param_name, param in inspect.signature(fn).parameters.items():
             type_hint = hints.get(param_name, param.annotation)
-            params[param_name] = {
+            entry: dict = {
                 "type": _clean_annotation(type_hint),
                 "required": param.default is inspect.Parameter.empty,
             }
             if param.default is not inspect.Parameter.empty:
-                params[param_name]["default"] = param.default
+                entry["default"] = param.default
+            if params and param_name in params:
+                entry["description"] = params[param_name]
+            params_dict[param_name] = entry
 
         _tool_schemas[name] = {
             "name": name,
             "description": description,
-            "parameters": params,
+            "parameters": params_dict,
         }
         return fn
     return decorator
@@ -103,6 +111,52 @@ async def run_tool(name: str, timeout_seconds: float = 30.0, **kwargs) -> ToolRe
 
 def list_tools() -> list[dict]:
     return list(_tool_schemas.values())
+
+
+_PYTHON_TO_JSON_TYPE: dict[str, str] = {
+    "str": "string",
+    "int": "integer",
+    "float": "number",
+    "bool": "boolean",
+    "list": "array",
+    "dict": "object",
+}
+
+
+def to_openai_tools(schemas: list[dict]) -> list[dict]:
+    """Convert bespoke tool schemas to the OpenAI/LiteLLM function-calling format."""
+    result = []
+    for schema in schemas:
+        params = schema.get("parameters", {})
+        properties: dict = {}
+        required: list[str] = []
+        for param_name, meta in params.items():
+            raw_type = meta.get("type", "any")
+            json_type = _PYTHON_TO_JSON_TYPE.get(raw_type, "string")
+            prop: dict = {"type": json_type}
+            if "description" in meta:
+                prop["description"] = meta["description"]
+            properties[param_name] = prop
+            if meta.get("required", False):
+                required.append(param_name)
+        result.append({
+            "type": "function",
+            "function": {
+                "name": schema["name"],
+                "description": schema.get("description", ""),
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            },
+        })
+    return result
+
+
+def _supports_native_tools(model: str) -> bool:
+    """Return True for models with reliable native function calling (non-Ollama)."""
+    return not model.startswith("ollama/")
 
 
 # ── Built-in tools ────────────────────────────────────────────────────────────

@@ -8,7 +8,7 @@ from app.database import get_engine
 from app.context.store import ContextSnapshot
 from app.context.models import Workflow, WorkflowStatus
 from app.agents.builder import get_agent
-from app.agents.orchestrator import run_agent, AGENT_TOTAL_TIMEOUT
+from app.agents.orchestrator import run_agent_with_timeout, AGENT_TOTAL_TIMEOUT
 import structlog
 
 log = structlog.get_logger()
@@ -84,15 +84,19 @@ def _purge_temp_uploads(cutoff: datetime) -> None:
             log.warning("temp_upload_unlink_failed", path=str(f), error=str(e))
 
 
-async def run_customer_analysis() -> None:
-    try:
-        config = get_agent("customer_analyst")
-        result = await run_agent(config)
-        log.info("scheduled_agent_complete", job="customer_analysis", run_id=result["run_id"])
-    except KeyError:
-        log.error("scheduled_agent_not_found", agent_id="customer_analyst")
-    except Exception as e:
-        log.error("scheduled_agent_failed", job="customer_analysis", error=str(e), exc_info=True)
+def _make_agent_job(agent_id: str):
+    """Return a coroutine function that runs a named agent with full timeout protection."""
+    async def _run():
+        try:
+            config = get_agent(agent_id)
+            result = await run_agent_with_timeout(config)
+            log.info("scheduled_agent_complete", agent_id=agent_id, run_id=result.get("run_id"))
+        except KeyError:
+            log.error("scheduled_agent_not_found", agent_id=agent_id)
+        except Exception as e:
+            log.error("scheduled_agent_failed", agent_id=agent_id, error=str(e), exc_info=True)
+    _run.__name__ = f"scheduled_{agent_id}"
+    return _run
 
 
 _STUCK_WORKFLOW_BUFFER_SECONDS = 60
@@ -159,14 +163,6 @@ def register_all_jobs(scheduler: AsyncIOScheduler) -> None:
         purge_orphan_doc_chunks,
         IntervalTrigger(hours=1),
         id="purge_orphan_doc_chunks",
-        replace_existing=True,
-        misfire_grace_time=3600,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        run_customer_analysis,
-        CronTrigger(day_of_week="mon", hour=8, minute=0),
-        id="customer_analysis",
         replace_existing=True,
         misfire_grace_time=3600,
         coalesce=True,

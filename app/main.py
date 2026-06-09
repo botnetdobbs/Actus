@@ -17,6 +17,7 @@ from app.automation.router import router as automation_router
 from app.automation.scheduler import scheduler, start_scheduler, stop_scheduler
 from app.observability.logging import configure_logging
 from app.observability.metrics import instrument_app
+from app import pubsub
 from starlette.middleware.base import BaseHTTPMiddleware
 import httpx
 import structlog
@@ -54,6 +55,7 @@ async def lifespan(app: FastAPI):
     from app.llm import pii  # noqa: F401 — Presidio NLP model load, controls when the 2-3s cost is paid
     from app.rag.embedder import warmup as warmup_embedder
     warmup_embedder()
+    await pubsub.init_redis(_settings.redis_url)
     discover_tools()
     try:
         load_agents()
@@ -63,9 +65,11 @@ async def lifespan(app: FastAPI):
 
     start_scheduler()
 
-    yield
-
-    stop_scheduler()
+    try:
+        yield
+    finally:
+        stop_scheduler()
+        await pubsub.close_redis()
 
 
 def create_app() -> FastAPI:

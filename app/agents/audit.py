@@ -8,6 +8,8 @@ import structlog
 
 log = structlog.get_logger()
 
+_TRACE_SIZE_LIMIT = 64 * 1024  # 64 KB
+
 
 class AgentRunLog(SQLModel, table=True):
     __tablename__: ClassVar[str] = "agent_run_logs"  # pyright: ignore[reportIncompatibleVariableOverride]
@@ -16,6 +18,7 @@ class AgentRunLog(SQLModel, table=True):
     agent_id: str | None = Field(default=None, index=True)
     run_id: str = Field(index=True)
     triggered_by: int | None = Field(default=None, index=True)
+    team_id: int | None = None
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None
     model: str | None = None
@@ -27,6 +30,7 @@ class AgentRunLog(SQLModel, table=True):
     outcome: str = "success"              # "success" | "incomplete" | "error" | "timeout"
     result_summary: str | None = None     # first 500 chars only, never raw output
     ip_address: str | None = None
+    trace_json: str | None = None         # iteration-level trace; capped at 64 KB
 
 
 class AgentRunLogResponse(BaseModel):
@@ -42,6 +46,7 @@ class AgentRunLogResponse(BaseModel):
     run_id: str
     agent_id: str | None
     triggered_by: int | None
+    team_id: int | None
     started_at: datetime
     completed_at: datetime | None
     model: str | None
@@ -52,7 +57,6 @@ class AgentRunLogResponse(BaseModel):
     tool_calls: list[dict]
     outcome: str
     result_summary: str | None
-    ip_address: str | None
 
     @field_validator("tool_calls", mode="before")
     @classmethod
@@ -72,6 +76,23 @@ class AgentRunLogResponse(BaseModel):
         return None
 
 
+def _cap_trace(trace: list[dict]) -> str:
+    """Serialise trace to a JSON object with embedded truncated flag.
+
+    If the serialised size exceeds 64 KB, tool call and result data is stripped
+    from all entries and truncated is set to True in the stored object.
+    """
+    body = json.dumps({"truncated": False, "iterations": trace})
+    if len(body.encode()) <= _TRACE_SIZE_LIMIT:
+        return body
+
+    trimmed = [dict(entry) for entry in trace]
+    for entry in trimmed:
+        entry.pop("tool_result", None)
+        entry.pop("tool_calls", None)
+    return json.dumps({"truncated": True, "iterations": trimmed})
+
+
 def log_agent_run(
     run_id: str,
     started_at: datetime,
@@ -84,13 +105,26 @@ def log_agent_run(
     tool_calls: list[dict] | None = None,
     agent_id: str | None = None,
     triggered_by: int | None = None,
+    team_id: int | None = None,
     result_summary: str | None = None,
     ip_address: str | None = None,
+    trace: list[dict] | None = None,
 ) -> None:
+    trace_json: str | None = None
+    if trace:
+        trace_json = _cap_trace(trace)
+        try:
+            stored = json.loads(trace_json)
+            if isinstance(stored, dict) and stored.get("truncated"):
+                log.warning("agent_run_trace_truncated", run_id=run_id)
+        except Exception:
+            pass
+
     entry = AgentRunLog(
         run_id=run_id,
         agent_id=agent_id,
         triggered_by=triggered_by,
+        team_id=team_id,
         started_at=started_at,
         completed_at=datetime.now(timezone.utc),
         model=model,
@@ -102,6 +136,7 @@ def log_agent_run(
         outcome=outcome,
         result_summary=result_summary,
         ip_address=ip_address,
+        trace_json=trace_json,
     )
     with Session(get_engine()) as session:
         try:

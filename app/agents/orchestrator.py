@@ -1,9 +1,10 @@
 import asyncio
 import uuid
 import json
+import jsonschema
 import structlog
 from app.agents.builder import AgentConfig
-from app.agents.tools import run_tool, _tool_schemas, _invoke_stack
+from app.agents.tools import run_tool, to_openai_tools, _supports_native_tools, _tool_schemas, _invoke_stack
 from app.context.models import AgentContext, ContextualData
 from app.context.store import save_context
 from app.rag.retriever import retrieve
@@ -21,6 +22,9 @@ _settings = get_settings()
 
 AGENT_TOTAL_TIMEOUT = 600  # 10 minutes max for an entire agent run
 LLM_PER_CALL_TIMEOUT = 120  # 120 seconds per LLM call
+
+_MAX_TOOL_RESULT_CHARS = 8_000
+_MAX_SCHEMA_CORRECTIONS = 2
 
 TOOL_CALL_PROMPT = """Available tools (respond ONLY with JSON):
 {tools}
@@ -66,6 +70,19 @@ def extract_json(content: str) -> str:
     return content
 
 
+def _validate_against_schema(result: str, schema: dict) -> tuple[bool, str]:
+    try:
+        data = json.loads(result)
+        jsonschema.validate(data, schema)
+        return True, ""
+    except json.JSONDecodeError:
+        return False, "Result is not valid JSON"
+    except jsonschema.ValidationError as e:
+        return False, e.message
+    except Exception as e:
+        return False, str(e)
+
+
 async def run_agent(config: AgentConfig, extra_context: dict | None = None,
                     event_queue: asyncio.Queue | None = None) -> dict:
     run_id = str(uuid.uuid4())
@@ -100,13 +117,31 @@ async def _run_agent_inner(
         if event_queue is not None:
             await event_queue.put(event)
 
+    # Determine protocol: native function calling vs bespoke JSON protocol
+    if config.native_tools is not None:
+        use_native = config.native_tools
+    else:
+        use_native = _supports_native_tools(config.model)
+
     allowed_schemas = [_tool_schemas[t] for t in config.tools if t in _tool_schemas]
     unregistered = [t for t in config.tools if t not in _tool_schemas]
     if unregistered:
         bound_log.warning("agent_tools_not_registered", tools=unregistered)
-    tools_desc = json.dumps(allowed_schemas, indent=2)
-    messages = [{"role": "system",
-                 "content": config.system_prompt.rstrip() + "\n\n" + TOOL_CALL_PROMPT.format(tools=tools_desc)}]
+
+    # Build system message
+    if use_native:
+        system_content = config.system_prompt
+    else:
+        tools_desc = json.dumps(allowed_schemas, indent=2)
+        system_content = config.system_prompt.rstrip() + "\n\n" + TOOL_CALL_PROMPT.format(tools=tools_desc)
+
+    if config.output_schema:
+        system_content += (
+            f"\n\nYour final result MUST be valid JSON conforming to this JSON Schema:\n"
+            f"{json.dumps(config.output_schema, indent=2)}"
+        )
+
+    messages: list[dict] = [{"role": "system", "content": system_content}]
 
     pii_detected = False
     context = AgentContext(agent_id=config.id, run_id=run_id)
@@ -156,6 +191,7 @@ async def _run_agent_inner(
             bound_log.error("context_save_failed", run_id=run_id, error=str(e))
 
     tool_calls_log: list[dict] = []
+    _trace: list[dict] = []
     iterations_used = 0
     total_tokens = 0
     prompt_tokens = 0
@@ -163,10 +199,35 @@ async def _run_agent_inner(
 
     api_base = config.api_base or (_settings.ollama_base_url if "ollama" in config.model else None)
 
+    _schema_corrections = 0
+
+    def _base_return(status: str, result=None, confidence=None, error=None) -> dict:
+        return {
+            "run_id": run_id,
+            "result": result,
+            "confidence": confidence,
+            "iterations": iterations_used,
+            "status": status,
+            "error": error,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "tool_calls": tool_calls_log,
+            "pii_detected": pii_detected,
+            "output_schema_valid": None,
+            "output_schema_errors": None,
+            "trace": _trace,
+        }
+
     for iteration in range(config.max_iterations):
         iterations_used = iteration + 1
         bound_log.info("agent_iteration", iteration=iteration)
         await _emit({"type": "iteration_start", "run_id": run_id, "iteration": iteration})
+
+        call_kwargs: dict = {}
+        if use_native and allowed_schemas:
+            call_kwargs["tools"] = to_openai_tools(allowed_schemas)
+            call_kwargs["tool_choice"] = "auto"
 
         try:
             response = await asyncio.wait_for(
@@ -175,8 +236,8 @@ async def _run_agent_inner(
                     messages=messages,
                     temperature=config.temperature,
                     max_tokens=config.max_response_tokens,
-                    timeout=LLM_PER_CALL_TIMEOUT,
                     api_base=api_base,
+                    **call_kwargs,
                 ),
                 timeout=LLM_PER_CALL_TIMEOUT,
             )
@@ -186,24 +247,18 @@ async def _run_agent_inner(
             _try_save_context()
             await _emit({"type": "done", "run_id": run_id, "status": "error",
                          "error": err, "iterations": iterations_used, "total_tokens": total_tokens})
-            return {"run_id": run_id, "result": None, "confidence": None,
-                    "iterations": iterations_used, "status": "error", "error": err,
-                    "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens, "tool_calls": tool_calls_log,
-                    "pii_detected": pii_detected}
+            return _base_return("error", error=err)
         except Exception as e:
             bound_log.error("llm_call_failed", iteration=iteration, error=str(e))
             _try_save_context()
             await _emit({"type": "done", "run_id": run_id, "status": "error",
                          "error": str(e), "iterations": iterations_used, "total_tokens": total_tokens})
-            return {"run_id": run_id, "result": None, "confidence": None,
-                    "iterations": iterations_used, "status": "error", "error": str(e),
-                    "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens, "tool_calls": tool_calls_log,
-                    "pii_detected": pii_detected}
+            return _base_return("error", error=str(e))
 
+        iter_tokens = 0
         if response.usage:  # pyright: ignore[reportAttributeAccessIssue]
-            total_tokens += response.usage.total_tokens  # pyright: ignore[reportAttributeAccessIssue]
+            iter_tokens = response.usage.total_tokens  # pyright: ignore[reportAttributeAccessIssue]
+            total_tokens += iter_tokens
             prompt_tokens += getattr(response.usage, "prompt_tokens", 0) or 0  # pyright: ignore[reportAttributeAccessIssue]
             completion_tokens += getattr(response.usage, "completion_tokens", 0) or 0  # pyright: ignore[reportAttributeAccessIssue]
             if total_tokens > config.token_budget:
@@ -213,19 +268,130 @@ async def _run_agent_inner(
                 await _emit({"type": "done", "run_id": run_id, "status": "incomplete",
                              "result": "Token budget exceeded", "iterations": iterations_used,
                              "total_tokens": total_tokens})
-                return {"run_id": run_id, "result": "Token budget exceeded",
-                        "confidence": None, "iterations": iterations_used, "status": "incomplete",
-                        "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                        "total_tokens": total_tokens, "tool_calls": tool_calls_log,
-                        "pii_detected": pii_detected}
+                return _base_return("incomplete", result="Token budget exceeded")
 
-        raw_content = response.choices[0].message.content  # pyright: ignore[reportAttributeAccessIssue]
+        message = response.choices[0].message  # pyright: ignore[reportAttributeAccessIssue]
+        raw_content = message.content
         content = (raw_content or "").strip()
+
+        # ── Native function-calling path ─────────────────────────────────────
+        if use_native:
+            native_tool_calls = getattr(message, "tool_calls", None) or []
+
+            # Record trace entry for native path
+            trace_entry: dict = {
+                "iteration": iteration,
+                "messages_sent_count": len(messages),
+                "system_prompt_preview": messages[0]["content"][:200],
+                "llm_response": content[:2000],
+                "tokens_this_iteration": iter_tokens,
+                "tool_calls": [],
+            }
+
+            if native_tool_calls:
+                # Add assistant message with tool_calls for proper conversation format
+                messages.append({
+                    "role": "assistant",
+                    "content": content or None,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        }
+                        for tc in native_tool_calls
+                    ],
+                })
+                for tc in native_tool_calls:
+                    tool_name = tc.function.name
+                    try:
+                        args = json.loads(tc.function.arguments or "{}")
+                        if not isinstance(args, dict):
+                            args = {}
+                    except (json.JSONDecodeError, ValueError):
+                        bound_log.warning("native_tool_args_parse_failed", tool=tool_name)
+                        args = {}
+
+                    if tool_name not in config.tools:
+                        bound_log.warning("agent_used_unauthorised_tool", tool=tool_name)
+                        tool_calls_log.append({"tool": tool_name, "success": False, "detail": "unauthorised"})
+                        messages.append({"role": "tool", "tool_call_id": tc.id,
+                                         "content": json.dumps({"error": "not permitted"})})
+                        trace_entry["tool_calls"].append(
+                            {"name": tool_name, "args": args, "success": False, "preview": ""})
+                        continue
+
+                    tool_timeout = AGENT_TOTAL_TIMEOUT if tool_name in _LONG_RUNNING_TOOLS else 30.0
+                    await _emit({"type": "tool_call", "run_id": run_id, "iteration": iteration,
+                                 "tool": tool_name, "args": args})
+                    tool_result = await run_tool(tool_name, timeout_seconds=tool_timeout, **args)
+                    preview = json.dumps(tool_result.output, default=str)[:300]
+                    await _emit({"type": "tool_result", "run_id": run_id, "iteration": iteration,
+                                 "tool": tool_name, "success": tool_result.success,
+                                 "preview": preview})
+                    tool_calls_log.append({
+                        "tool": tool_name,
+                        "success": tool_result.success,
+                        "detail": tool_result.error if not tool_result.success else "",
+                    })
+                    tool_output = (json.dumps(tool_result.output, default=str)
+                                   if tool_result.output is not None else "null")
+                    if len(tool_output) > _MAX_TOOL_RESULT_CHARS:
+                        bound_log.warning("tool_result_truncated", tool=tool_name,
+                                          original_len=len(tool_output))
+                        tool_output = tool_output[:_MAX_TOOL_RESULT_CHARS] + " ... [truncated]"
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": tool_output})
+
+                    trace_entry["tool_calls"].append(
+                        {"name": tool_name, "args": args,
+                         "success": tool_result.success, "preview": preview})
+
+                _trace.append(trace_entry)
+                continue  # next iteration
+
+            # No tool_calls → done; content is the final answer
+            _trace.append(trace_entry)
+            _try_save_context()
+
+            output_schema_valid: bool | None = None
+            if config.output_schema:
+                valid, errors = _validate_against_schema(content, config.output_schema)
+                if (not valid and _schema_corrections < _MAX_SCHEMA_CORRECTIONS
+                        and iteration < config.max_iterations - 1):
+                    _schema_corrections += 1
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({"role": "user",
+                                     "content": f"Your result does not conform to the schema. "
+                                                f"Errors: {errors[:400]}. Try again."})
+                    continue
+                output_schema_valid = valid
+
+            bound_log.info("agent_run_complete", iterations=iterations_used, total_tokens=total_tokens)
+            await _emit({"type": "done", "run_id": run_id, "status": "completed",
+                         "result": content, "iterations": iterations_used,
+                         "total_tokens": total_tokens})
+            ret = _base_return("completed", result=content)
+            ret["output_schema_valid"] = output_schema_valid
+            if output_schema_valid is False:
+                ret["output_schema_errors"] = errors
+            return ret
+
+        # ── Bespoke JSON protocol path ────────────────────────────────────────
         messages.append({"role": "assistant", "content": content})
+
+        trace_entry = {
+            "iteration": iteration,
+            "messages_sent_count": len(messages),
+            "system_prompt_preview": messages[0]["content"][:200],
+            "llm_response": content[:2000],
+            "tokens_this_iteration": iter_tokens,
+            "tool_calls": [],
+        }
 
         try:
             action = json.loads(extract_json(content))
         except json.JSONDecodeError:
+            _trace.append(trace_entry)
             bound_log.warning("llm_non_json_response", iteration=iteration)
             if iteration < config.max_iterations - 1:
                 messages.append({"role": "user",
@@ -235,13 +401,10 @@ async def _run_agent_inner(
             _try_save_context()
             await _emit({"type": "done", "run_id": run_id, "status": "incomplete",
                          "result": content, "iterations": iterations_used, "total_tokens": total_tokens})
-            return {"run_id": run_id, "result": content, "confidence": None,
-                    "iterations": iterations_used, "status": "incomplete",
-                    "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens, "tool_calls": tool_calls_log,
-                    "pii_detected": pii_detected}
+            return _base_return("incomplete", result=content)
 
         if not action.get("done") and "tool" not in action:
+            _trace.append(trace_entry)
             bound_log.warning("llm_empty_action", iteration=iteration)
             messages.append({"role": "user",
                               "content": "Your response was not a valid tool call or done signal. "
@@ -249,17 +412,36 @@ async def _run_agent_inner(
             continue
 
         if action.get("done"):
+            result_val = action.get("result")
+            confidence = action.get("confidence")
+            _trace.append(trace_entry)
+
+            output_schema_valid = None
+            errors = ""
+            if config.output_schema:
+                valid, errors = _validate_against_schema(
+                    result_val if isinstance(result_val, str) else json.dumps(result_val),
+                    config.output_schema,
+                )
+                if (not valid and _schema_corrections < _MAX_SCHEMA_CORRECTIONS
+                        and iteration < config.max_iterations - 1):
+                    _schema_corrections += 1
+                    messages.append({"role": "user",
+                                     "content": f"Your result does not conform to the schema. "
+                                                f"Errors: {errors[:400]}. Try again."})
+                    continue
+                output_schema_valid = valid
+
             bound_log.info("agent_run_complete", iterations=iterations_used, total_tokens=total_tokens)
             _try_save_context()
             await _emit({"type": "done", "run_id": run_id, "status": "completed",
-                         "result": action.get("result"), "confidence": action.get("confidence"),
+                         "result": result_val, "confidence": confidence,
                          "iterations": iterations_used, "total_tokens": total_tokens})
-            return {"run_id": run_id, "result": action.get("result"),
-                    "confidence": action.get("confidence"),
-                    "iterations": iterations_used, "status": "completed",
-                    "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens, "tool_calls": tool_calls_log,
-                    "pii_detected": pii_detected}
+            ret = _base_return("completed", result=result_val, confidence=confidence)
+            ret["output_schema_valid"] = output_schema_valid
+            if output_schema_valid is False:
+                ret["output_schema_errors"] = errors
+            return ret
 
         if "tool" in action:
             tool_name = action["tool"]
@@ -269,6 +451,7 @@ async def _run_agent_inner(
                                   "content": f"Tool '{tool_name}' is not available to you. "
                                              f"Available tools: {config.tools}"})
                 tool_calls_log.append({"tool": tool_name, "success": False, "detail": "unauthorised"})
+                _trace.append(trace_entry)
                 continue
 
             tool_timeout = (AGENT_TOTAL_TIMEOUT if tool_name in _LONG_RUNNING_TOOLS
@@ -281,19 +464,30 @@ async def _run_agent_inner(
             await _emit({"type": "tool_call", "run_id": run_id, "iteration": iteration,
                          "tool": tool_name, "args": args})
             tool_result = await run_tool(tool_name, timeout_seconds=tool_timeout, **args)
+            preview = json.dumps(tool_result.output, default=str)[:300]
             await _emit({"type": "tool_result", "run_id": run_id, "iteration": iteration,
                          "tool": tool_name, "success": tool_result.success,
-                         "preview": json.dumps(tool_result.output, default=str)[:300]})
+                         "preview": preview})
             tool_calls_log.append({
                 "tool": tool_name,
                 "success": tool_result.success,
                 "detail": tool_result.error if not tool_result.success else "",
             })
+
+            trace_entry["tool_calls"].append(
+                {"name": tool_name, "args": args,
+                 "success": tool_result.success, "preview": preview})
+            _trace.append(trace_entry)
+
             if tool_result.success:
                 tool_output = (json.dumps(tool_result.output, default=str)
                                if tool_result.output is not None else "null")
             else:
                 tool_output = json.dumps({"error": tool_result.error})
+            if len(tool_output) > _MAX_TOOL_RESULT_CHARS:
+                bound_log.warning("tool_result_truncated", tool=tool_name,
+                                  original_len=len(tool_output))
+                tool_output = tool_output[:_MAX_TOOL_RESULT_CHARS] + " ... [truncated]"
             messages.append({"role": "user", "content": f"Tool result: {tool_output}"})
 
     bound_log.warning("agent_max_iterations_reached", iterations=iterations_used, total_tokens=total_tokens)
@@ -301,11 +495,7 @@ async def _run_agent_inner(
     await _emit({"type": "done", "run_id": run_id, "status": "incomplete",
                  "result": "Max iterations reached", "iterations": iterations_used,
                  "total_tokens": total_tokens})
-    return {"run_id": run_id, "result": "Max iterations reached",
-            "confidence": None, "iterations": iterations_used, "status": "incomplete",
-            "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens, "tool_calls": tool_calls_log,
-            "pii_detected": pii_detected}
+    return _base_return("incomplete", result="Max iterations reached")
 
 
 async def run_agent_with_timeout(config: AgentConfig, extra_context: dict | None = None,
@@ -320,4 +510,5 @@ async def run_agent_with_timeout(config: AgentConfig, extra_context: dict | None
         return {"run_id": "unknown", "result": "Agent run exceeded time limit",
                 "confidence": None, "iterations": 0, "status": "timeout",
                 "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
-                "tool_calls": [], "pii_detected": False}
+                "tool_calls": [], "pii_detected": False, "output_schema_valid": None,
+                "output_schema_errors": None, "trace": []}

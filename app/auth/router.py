@@ -5,7 +5,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import Session, select
 from app.database import get_session
-from app.auth.models import User, hash_password, verify_password
+from app.auth.models import Team, User, hash_password, verify_password
 from app.auth.jwt import create_access_token, get_current_user, require_role, write_audit_log
 import structlog
 
@@ -46,7 +46,26 @@ class UserResponse(BaseModel):
     username: str
     role: str
     is_active: bool
+    team_id: int | None = None
     created_at: datetime
+
+
+class TeamCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+
+
+class TeamAssignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    team_id: int | None
+
+
+class TeamResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int | None
+    name: str
+    created_at: datetime
+    created_by: int | None
 
 
 @router.post("/register", response_model=UserResponse, status_code=201)
@@ -216,4 +235,66 @@ async def reset_password(
 
     log.info("password_reset", by=admin.username, target=target.username)
     write_audit_log(username=admin.username, action="reset_password", resource=target.username, success=True)
+    return target
+
+
+# ── Team management ───────────────────────────────────────────────────────────
+
+@router.post("/teams", response_model=TeamResponse, status_code=201)
+async def create_team(
+    req: TeamCreateRequest,
+    session: Session = Depends(get_session),
+    admin: User = Depends(require_role("admin")),
+):
+    existing = session.exec(
+        select(Team).where(Team.name == req.name, Team.is_deleted == False)
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Team name already taken")
+    team = Team(name=req.name, created_by=admin.id)
+    session.add(team)
+    session.commit()
+    session.refresh(team)
+    log.info("team_created", by=admin.username, team=req.name)
+    write_audit_log(username=admin.username, action="create_team", resource=req.name, success=True)
+    return team
+
+
+@router.get("/teams", response_model=list[TeamResponse])
+async def list_teams(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_role("admin")),
+):
+    return session.exec(select(Team).where(Team.is_deleted == False)).all()
+
+
+@router.patch("/users/{user_id}/team", response_model=UserResponse)
+async def assign_team(
+    user_id: int,
+    req: TeamAssignRequest,
+    session: Session = Depends(get_session),
+    admin: User = Depends(require_role("admin")),
+):
+    target = session.exec(
+        select(User).where(User.id == user_id, User.is_deleted == False)
+    ).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if req.team_id is not None:
+        team = session.exec(
+            select(Team).where(Team.id == req.team_id, Team.is_deleted == False)
+        ).first()
+        if not team:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+    target.team_id = req.team_id
+    target.touch()
+    session.add(target)
+    session.commit()
+    session.refresh(target)
+
+    log.info("team_assigned", by=admin.username, target=target.username, team_id=req.team_id)
+    write_audit_log(username=admin.username, action="assign_team", resource=target.username, success=True,
+                    detail=str(req.team_id))
     return target

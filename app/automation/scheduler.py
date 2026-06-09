@@ -1,8 +1,10 @@
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
+from apscheduler.triggers.cron import CronTrigger
 from app.config import get_settings
-from app.automation.jobs import register_all_jobs
+from app.agents.builder import list_agents
+from app.automation.jobs import register_all_jobs, _make_agent_job
 import structlog
 
 log = structlog.get_logger()
@@ -30,6 +32,17 @@ def job_listener(event) -> None:
 def start_scheduler() -> None:
     scheduler.add_listener(job_listener, EVENT_JOB_ERROR | EVENT_JOB_EXECUTED)
     register_all_jobs(scheduler)
+    for config in list_agents():
+        if config.schedule and config.schedule.cron:
+            scheduler.add_job(
+                _make_agent_job(config.id),
+                CronTrigger.from_crontab(config.schedule.cron),
+                id=f"agent_{config.id}",
+                replace_existing=True,
+                misfire_grace_time=3600,
+                coalesce=True,
+            )
+            log.info("agent_job_registered", agent_id=config.id, cron=config.schedule.cron)
     scheduler.start()
     log.info("scheduler_started", job_count=len(scheduler.get_jobs()))
 
