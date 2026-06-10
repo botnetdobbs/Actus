@@ -1,9 +1,10 @@
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 import structlog
+from sqlalchemy import CursorResult, delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
 from app.database import get_engine
 from app.rag.embedder import embed
@@ -101,15 +102,10 @@ def delete_by_type(type_name: str) -> int:
     if not _is_postgres():
         return 0
     with Session(get_engine()) as session:
-        rows = session.exec(
-            select(VectorIndex).where(VectorIndex.object_type == type_name)
-        ).all()
-        count = len(rows)
-        for row in rows:
-            session.delete(row)
+        result = cast(CursorResult, session.execute(delete(VectorIndex).where(col(VectorIndex.object_type) == type_name)))
         session.commit()
-    log.info("rag_type_deleted", type=type_name, count=count)
-    return count
+    log.info("rag_type_deleted", type=type_name, count=result.rowcount)
+    return result.rowcount
 
 
 def delete_from_index(type_name: str, object_id: int) -> None:

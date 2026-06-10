@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     # Retry settings
     llm_max_retries: int = 3
     llm_retry_base_delay: float = 1.0
+    # Restrict which models callers may request via /llm/*. Empty = no restriction.
+    allowed_models: list[str] = []
+    # How long audit log entries (incl. IP addresses) are retained before purge
+    audit_log_retention_days: int = 90
     # RAG
     embedding_model: str = "all-MiniLM-L6-v2"
     # Redis pub/sub for cross-process SSE fan-out; falls back to DB polling if empty

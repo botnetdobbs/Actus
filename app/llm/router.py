@@ -4,12 +4,12 @@ import time
 import litellm
 from litellm.exceptions import APIConnectionError, Timeout, ServiceUnavailableError, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from app.config import get_settings
 from app.limiter import limiter
 from app.llm.models import CompletionRequest, CompletionResponse
-from app.llm.pii import scrub_pii
+from app.llm.pii import scrub_pii_async
 from app.observability.metrics import llm_calls_total, llm_latency
 import structlog
 
@@ -42,12 +42,14 @@ async def call_llm_with_retry(model, messages, **kwargs):
 @limiter.limit("20/minute")
 async def complete(request: Request, req: CompletionRequest):
     model = req.model or _settings.default_model
+    if _settings.allowed_models and model not in _settings.allowed_models:
+        raise HTTPException(status_code=403, detail=f"Model '{model}' is not in the allow-list")
     pii_found = False
     clean_messages = []
 
     for msg in req.messages:
         if msg.role == "user":
-            clean_content, detected = scrub_pii(msg.content)
+            clean_content, detected = await scrub_pii_async(msg.content)
             pii_found = pii_found or detected
             clean_messages.append({"role": msg.role, "content": clean_content})
         else:
@@ -101,12 +103,15 @@ async def complete(request: Request, req: CompletionRequest):
 
 
 @router.post("/chat/stream")
+@limiter.limit("10/minute")
 async def chat_stream(request: Request, req: CompletionRequest):
     model = req.model or _settings.default_model
+    if _settings.allowed_models and model not in _settings.allowed_models:
+        raise HTTPException(status_code=403, detail=f"Model '{model}' is not in the allow-list")
     clean_messages = []
     for msg in req.messages:
         if msg.role == "user":
-            clean_content, _ = scrub_pii(msg.content)
+            clean_content, _ = await scrub_pii_async(msg.content)
             clean_messages.append({"role": msg.role, "content": clean_content})
         else:
             clean_messages.append(msg.model_dump())
@@ -131,7 +136,7 @@ async def chat_stream(request: Request, req: CompletionRequest):
             yield "\n\n[Error: Could not connect to LLM]"
         except Exception as e:
             log.error("stream_error", model=model, error=str(e))
-            yield f"\n\n[Error: {type(e).__name__}]"
+            yield "\n\n[Error: internal error]"
 
     return StreamingResponse(
         token_generator(),

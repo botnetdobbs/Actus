@@ -24,14 +24,14 @@ def auth_header(token: str) -> dict:
 # ── registration ──────────────────────────────────────────────────────────────
 
 def test_register_creates_viewer(client):
-    resp = client.post("/auth/register", json={"username": "newuser", "password": "pass1234"})
+    resp = client.post("/v1/auth/register", json={"username": "newuser", "password": "pass1234"})
     assert resp.status_code == 201
     assert resp.json()["role"] == "viewer"
 
 
 def test_register_rejects_role_field(client):
     resp = client.post(
-        "/auth/register",
+        "/v1/auth/register",
         json={"username": "hacker", "password": "pass1234", "role": "admin"},
     )
     assert resp.status_code == 422
@@ -39,7 +39,7 @@ def test_register_rejects_role_field(client):
 
 def test_register_duplicate_username(client, engine):
     seed_user(engine, "alice", "viewer")
-    resp = client.post("/auth/register", json={"username": "alice", "password": "pass1234"})
+    resp = client.post("/v1/auth/register", json={"username": "alice", "password": "pass1234"})
     assert resp.status_code == 409
 
 
@@ -47,41 +47,41 @@ def test_register_duplicate_username(client, engine):
 
 def test_login_returns_token(client, engine):
     seed_user(engine, "bob", "viewer")
-    resp = client.post("/auth/login", data={"username": "bob", "password": "testpass"})
+    resp = client.post("/v1/auth/login", data={"username": "bob", "password": "testpass"})
     assert resp.status_code == 200
     assert "access_token" in resp.json()
 
 
 def test_login_wrong_password(client, engine):
     seed_user(engine, "carol", "viewer")
-    resp = client.post("/auth/login", data={"username": "carol", "password": "wrong"})
+    resp = client.post("/v1/auth/login", data={"username": "carol", "password": "wrong"})
     assert resp.status_code == 401
 
 
 def test_login_unknown_user(client):
-    resp = client.post("/auth/login", data={"username": "ghost", "password": "pass"})
+    resp = client.post("/v1/auth/login", data={"username": "ghost", "password": "pass"})
     assert resp.status_code == 401
 
 
 def test_account_lockout_after_max_failures(client, engine):
     seed_user(engine, "dave", "viewer")
     for _ in range(5):
-        client.post("/auth/login", data={"username": "dave", "password": "wrong"})
-    resp = client.post("/auth/login", data={"username": "dave", "password": "testpass"})
+        client.post("/v1/auth/login", data={"username": "dave", "password": "wrong"})
+    resp = client.post("/v1/auth/login", data={"username": "dave", "password": "testpass"})
     assert resp.status_code == 403
 
 
 # ── /me ───────────────────────────────────────────────────────────────────────
 
 def test_me_requires_auth(client):
-    resp = client.get("/auth/me")
+    resp = client.get("/v1/auth/me")
     assert resp.status_code == 401
 
 
 def test_me_returns_current_user(client, engine):
     seed_user(engine, "eve", "analyst")
     token = get_token(client, "eve")
-    resp = client.get("/auth/me", headers=auth_header(token))
+    resp = client.get("/v1/auth/me", headers=auth_header(token))
     assert resp.status_code == 200
     assert resp.json()["username"] == "eve"
     assert resp.json()["role"] == "analyst"
@@ -91,7 +91,7 @@ def test_me_returns_current_user(client, engine):
 
 def test_unauthenticated_blocked_from_admin_endpoint(client, engine):
     target = seed_user(engine, "target1", "viewer")
-    resp = client.patch(f"/auth/users/{target.id}/role", json={"role": "analyst"})
+    resp = client.patch(f"/v1/auth/users/{target.id}/role", json={"role": "analyst"})
     assert resp.status_code == 401
 
 
@@ -100,7 +100,7 @@ def test_viewer_blocked_from_admin_endpoint(client, engine):
     target = seed_user(engine, "target2", "viewer")
     token = get_token(client, "viewer1")
     resp = client.patch(
-        f"/auth/users/{target.id}/role",
+        f"/v1/auth/users/{target.id}/role",
         json={"role": "analyst"},
         headers=auth_header(token),
     )
@@ -112,7 +112,7 @@ def test_analyst_blocked_from_admin_endpoint(client, engine):
     target = seed_user(engine, "target3", "viewer")
     token = get_token(client, "analyst1")
     resp = client.patch(
-        f"/auth/users/{target.id}/role",
+        f"/v1/auth/users/{target.id}/role",
         json={"role": "analyst"},
         headers=auth_header(token),
     )
@@ -124,7 +124,7 @@ def test_admin_can_access_admin_endpoint(client, engine):
     target = seed_user(engine, "target4", "viewer")
     token = get_token(client, "admin1")
     resp = client.patch(
-        f"/auth/users/{target.id}/role",
+        f"/v1/auth/users/{target.id}/role",
         json={"role": "analyst"},
         headers=auth_header(token),
     )
@@ -137,7 +137,7 @@ def test_invalid_role_rejected(client, engine):
     target = seed_user(engine, "target5", "viewer")
     token = get_token(client, "admin2")
     resp = client.patch(
-        f"/auth/users/{target.id}/role",
+        f"/v1/auth/users/{target.id}/role",
         json={"role": "superuser"},
         headers=auth_header(token),
     )

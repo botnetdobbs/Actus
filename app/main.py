@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import Depends, FastAPI, Request
+from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
@@ -70,7 +70,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         if _settings.scheduler_enabled:
-            stop_scheduler()
+            await stop_scheduler()
         await pubsub.close_redis()
 
 
@@ -92,11 +92,13 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    app.include_router(auth_router, prefix="/auth", tags=["Auth"])
-    app.include_router(automation_router, prefix="/automation", tags=["Automation"])
-    app.include_router(llm_router, prefix="/llm", tags=["LLM"])
-    app.include_router(ontology_router, prefix="/ontology", tags=["Ontology"])
-    discover_routers(app)    # registers app/agents/*/router.py
+    v1 = APIRouter(prefix="/v1")
+    v1.include_router(auth_router, prefix="/auth", tags=["Auth"])
+    v1.include_router(automation_router, prefix="/automation", tags=["Automation"])
+    v1.include_router(llm_router, prefix="/llm", tags=["LLM"])
+    v1.include_router(ontology_router, prefix="/ontology", tags=["Ontology"])
+    discover_routers(v1)    # registers app/agents/*/router.py
+    app.include_router(v1)
 
     @app.get("/healthz", tags=["Health"])
     async def health(session: Session = Depends(get_session)):

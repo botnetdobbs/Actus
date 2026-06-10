@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 from typing import ClassVar
 from sqlalchemy import DateTime as SADateTime, Column
@@ -37,6 +38,7 @@ class User(SQLModel, table=True):
         default=None, sa_column=Column(SADateTime(timezone=True))
     )
     is_deleted: bool = Field(default=False, index=True)
+    token_version: int = Field(default=0)
     deleted_at: datetime | None = None
     deleted_by: int | None = None
 
@@ -85,3 +87,11 @@ def hash_password(password: str) -> str:
 
 def verify_password(plain: str, hashed: str) -> bool:
     return _bcrypt.checkpw(plain.encode(), hashed.encode())
+
+
+async def hash_password_async(password: str) -> str:
+    return await asyncio.get_running_loop().run_in_executor(None, hash_password, password)
+
+
+async def verify_password_async(plain: str, hashed: str) -> bool:
+    return await asyncio.get_running_loop().run_in_executor(None, verify_password, plain, hashed)

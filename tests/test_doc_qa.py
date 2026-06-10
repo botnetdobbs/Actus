@@ -287,16 +287,14 @@ class TestDeleteByType:
 
     def test_returns_count(self):
         from app.rag.indexer import delete_by_type
-        mock_rows = [MagicMock(), MagicMock(), MagicMock()]
         mock_session = MagicMock()
         mock_session.__enter__ = MagicMock(return_value=mock_session)
         mock_session.__exit__ = MagicMock(return_value=False)
-        mock_session.exec.return_value.all.return_value = mock_rows
+        mock_session.execute.return_value.rowcount = 3
         with patch("app.rag.indexer._is_postgres", return_value=True), \
              patch("app.rag.indexer.Session", return_value=mock_session):
             result = delete_by_type("doc:my-session")
         assert result == 3
-        assert mock_session.delete.call_count == 3
         mock_session.commit.assert_called_once()
 
 
@@ -304,14 +302,14 @@ class TestDeleteByType:
 
 class TestUploadEndpoint:
     def test_requires_auth(self, client):
-        resp = client.post("/doc-qa/upload", files={"file": ("doc.pdf", b"data", "application/pdf")})
+        resp = client.post("/v1/doc-qa/upload", files={"file": ("doc.pdf", b"data", "application/pdf")})
         assert resp.status_code == 401
 
     def test_viewer_blocked(self, client, engine):
         seed_user(engine, "viewer1", "viewer")
         token = get_token(client, "viewer1")
         resp = client.post(
-            "/doc-qa/upload",
+            "/v1/doc-qa/upload",
             headers={"Authorization": f"Bearer {token}"},
             files={"file": ("doc.pdf", b"data", "application/pdf")},
         )
@@ -321,7 +319,7 @@ class TestUploadEndpoint:
         seed_user(engine, "analyst1", "analyst")
         token = get_token(client, "analyst1")
         resp = client.post(
-            "/doc-qa/upload",
+            "/v1/doc-qa/upload",
             headers={"Authorization": f"Bearer {token}"},
             files={"file": ("doc.txt", b"hello", "text/plain")},
         )
@@ -332,7 +330,7 @@ class TestUploadEndpoint:
         token = get_token(client, "analyst2")
         with patch("app.agents.doc_qa.router.UPLOAD_DIR", tmp_path):
             resp = client.post(
-                "/doc-qa/upload",
+                "/v1/doc-qa/upload",
                 headers={"Authorization": f"Bearer {token}"},
                 files={"file": ("report.pdf", b"pdfcontent", "application/pdf")},
             )
@@ -348,7 +346,7 @@ class TestUploadEndpoint:
         token = get_token(client, "analyst3")
         with patch("app.agents.doc_qa.router.UPLOAD_DIR", tmp_path):
             resp = client.post(
-                "/doc-qa/upload",
+                "/v1/doc-qa/upload",
                 headers={"Authorization": f"Bearer {token}"},
                 files={"file": ("brief.docx", b"docxdata", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
             )
@@ -361,7 +359,7 @@ class TestUploadEndpoint:
         big = b"x" * (21 * 1024 * 1024)
         with patch("app.agents.doc_qa.router.UPLOAD_DIR", tmp_path):
             resp = client.post(
-                "/doc-qa/upload",
+                "/v1/doc-qa/upload",
                 headers={"Authorization": f"Bearer {token}"},
                 files={"file": ("big.pdf", big, "application/pdf")},
             )
@@ -387,7 +385,7 @@ class TestTriggerExtraContext:
         with patch("app.automation.router.get_agent", return_value=cfg), \
              patch("app.automation.router._run_workflow"):
             resp = client.post(
-                "/automation/trigger/doc_qa",
+                "/v1/automation/trigger/doc_qa",
                 headers={"Authorization": f"Bearer {token}"},
                 json={"extra_context": {"file_path": "/tmp/x.pdf", "question": "What?"}},
             )
@@ -408,7 +406,7 @@ class TestTriggerExtraContext:
         with patch("app.automation.router.get_agent", return_value=cfg), \
              patch("app.automation.router._run_workflow"):
             resp = client.post(
-                "/automation/trigger/doc_qa",
+                "/v1/automation/trigger/doc_qa",
                 headers={"Authorization": f"Bearer {token}"},
             )
         assert resp.status_code == 202

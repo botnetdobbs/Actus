@@ -15,7 +15,7 @@ Actus provides the platform, you bring the tools. A tool is a Python function de
 ```
 Python 3.13      FastAPI + Uvicorn       SQLModel + SQLite/PostgreSQL
 LiteLLM          Ollama                  Presidio (PII)
-APScheduler      structlog               bcrypt + python-jose
+APScheduler      structlog               bcrypt + PyJWT
 pytest + httpx
 ```
 
@@ -45,8 +45,8 @@ To check when Ollama is ready:
 
 ```bash
 curl http://localhost:8000/healthz
-# Not ready yet:  {"status":"degraded","checks":{"database":"ok","ollama":"unreachable"}}
-# Ready:          {"status":"ok","checks":{"database":"ok","ollama":"ok"}}
+# Not ready yet:  {"status":"degraded","core":{"database":"ok"},"info":{"ollama":"unreachable","redis":"ok"}}
+# Ready:          {"status":"ok","core":{"database":"ok"},"info":{"ollama":"ok","redis":"ok"}}
 ```
 
 **Services:**
@@ -84,10 +84,10 @@ Answers questions about uploaded PDF and DOCX files. Demonstrates: file upload �
 **Step 1 — Upload the document**
 
 ```bash
-TOKEN=$(curl -s -X POST http://localhost:8000/auth/login \
+TOKEN=$(curl -s -X POST http://localhost:8000/v1/auth/login \
   -d "username=admin&password=pass" | jq -r .access_token)
 
-FILE_PATH=$(curl -s -X POST http://localhost:8000/doc-qa/upload \
+FILE_PATH=$(curl -s -X POST http://localhost:8000/v1/doc-qa/upload \
   -H "Authorization: Bearer $TOKEN" \
   -F "file=@/path/to/report.pdf" | jq -r .file_path)
 ```
@@ -95,7 +95,7 @@ FILE_PATH=$(curl -s -X POST http://localhost:8000/doc-qa/upload \
 **Step 2 — Trigger the agent with the file path and your question**
 
 ```bash
-WF_ID=$(curl -s -X POST http://localhost:8000/automation/trigger/doc_qa \
+WF_ID=$(curl -s -X POST http://localhost:8000/v1/automation/trigger/doc_qa \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d "{\"extra_context\": {\"file_path\": \"$FILE_PATH\", \"question\": \"What are the main findings?\"}}" \
@@ -106,11 +106,11 @@ WF_ID=$(curl -s -X POST http://localhost:8000/automation/trigger/doc_qa \
 
 ```bash
 # Stream live events — closes automatically when the agent finishes
-curl -N "http://localhost:8000/automation/workflows/$WF_ID/stream" \
+curl -N "http://localhost:8000/v1/automation/workflows/$WF_ID/stream" \
   -H "Authorization: Bearer $TOKEN"
 
 # Or watch the poll endpoint (refreshes every 2 s)
-watch -n 2 curl -s "http://localhost:8000/automation/workflows/$WF_ID" \
+watch -n 2 curl -s "http://localhost:8000/v1/automation/workflows/$WF_ID" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -119,6 +119,45 @@ watch -n 2 curl -s "http://localhost:8000/automation/workflows/$WF_ID" \
 **How it works:** The agent calls `chunk_and_index_document` (parse + embed chunks into pgvector), then `search_document` (semantic retrieval), then composes an answer grounded in the retrieved passages, then calls `cleanup_document` to remove the session's vector index rows before signalling done.
 
 **SQLite dev mode:** Indexing and retrieval are no-ops on SQLite. The agent will respond that no document information was found — expected behaviour. Run with PostgreSQL for full functionality.
+
+---
+
+## API
+
+All application routes are versioned under `/v1` (e.g. `/v1/auth/login`, `/v1/automation/...`, `/v1/llm/...`). `/healthz` and `/docs` remain unprefixed.
+
+### Auth
+
+| Endpoint | Notes |
+|---|---|
+| `POST /v1/auth/login` | OAuth2 password grant. Returns `access_token` + `refresh_token` |
+| `POST /v1/auth/refresh` | Exchange a refresh token for a new token pair |
+| `POST /v1/auth/logout` | Revokes the presented access token |
+
+Admin actions that change a user's credentials or privileges (password reset, role change, account deletion) bump that user's `token_version`, which immediately invalidates all of their previously issued access and refresh tokens.
+
+### Model allow-list
+
+By default, `/v1/llm/*` accepts any LiteLLM-routable model string. Set `ALLOWED_MODELS` (JSON list) in your environment to restrict which models callers may request. Requests for any other model return `403`. See `.env.example`.
+
+---
+
+## Production: TLS & Reverse Proxy
+
+Actus does not terminate TLS itself. Run it behind a reverse proxy (Caddy, nginx, Traefik) that:
+
+- Terminates TLS and forwards plain HTTP to the `actus` container.
+- Forwards the real client IP via `X-Forwarded-For`, the `actus` container's uvicorn is started with `--proxy-headers --forwarded-allow-ips=...` (see `docker-compose.yml` / `FORWARDED_ALLOW_IPS` in `.env.example`) so `request.client.host` (used in audit logs and rate-limit keys) reflects the real client, not the proxy. The default trusts the Docker bridge network range (`172.16.0.0/12`); narrow this to your proxy's actual address in production, and never set it to `*`. Anyone able to reach the `actus` container directly (e.g. the published port) could otherwise spoof their source IP.
+
+Minimal Caddy example:
+
+```
+app.example.com {
+    reverse_proxy localhost:8000
+}
+```
+
+Set `CORS_ORIGINS` to your public HTTPS origin(s), e.g. `CORS_ORIGINS=["https://app.example.com"]`.
 
 ---
 

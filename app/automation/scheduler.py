@@ -1,3 +1,4 @@
+import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
@@ -47,7 +48,11 @@ def start_scheduler() -> None:
     log.info("scheduler_started", job_count=len(scheduler.get_jobs()))
 
 
-def stop_scheduler() -> None:
+async def stop_scheduler(timeout: float = 30.0) -> None:
     if scheduler.running:
-        scheduler.shutdown(wait=False)
+        loop = asyncio.get_running_loop()
+        try:
+            await asyncio.wait_for(loop.run_in_executor(None, scheduler.shutdown, True), timeout=timeout)
+        except asyncio.TimeoutError:
+            log.warning("scheduler_shutdown_timeout", timeout=timeout)
         log.info("scheduler_stopped")

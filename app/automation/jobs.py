@@ -1,12 +1,16 @@
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import cast
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from sqlalchemy import CursorResult, delete
 from sqlmodel import Session, select, col, text
+from app.config import get_settings
 from app.database import get_engine
 from app.context.store import ContextSnapshot
 from app.context.models import Workflow, WorkflowStatus
+from app.auth.models import AuditLog
 from app.agents.builder import get_agent
 from app.agents.orchestrator import run_agent_with_timeout, AGENT_TOTAL_TIMEOUT
 import structlog
@@ -37,6 +41,15 @@ async def purge_old_context_snapshots() -> int:
             raise
         log.info("context_purge_complete", deleted=len(old))
         return len(old)
+
+
+async def purge_old_audit_logs() -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=get_settings().audit_log_retention_days)
+    with Session(get_engine()) as session:
+        result = cast(CursorResult, session.execute(delete(AuditLog).where(col(AuditLog.timestamp) < cutoff)))
+        session.commit()
+    log.info("audit_logs_purged", deleted=result.rowcount)
+    return result.rowcount
 
 
 async def purge_orphan_doc_chunks() -> int:
@@ -155,6 +168,14 @@ def register_all_jobs(scheduler: AsyncIOScheduler) -> None:
         purge_old_context_snapshots,
         CronTrigger(hour=2, minute=0),
         id="purge_context_snapshots",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        purge_old_audit_logs,
+        CronTrigger(hour=3, minute=0),
+        id="purge_old_audit_logs",
         replace_existing=True,
         misfire_grace_time=3600,
         coalesce=True,

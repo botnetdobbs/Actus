@@ -2,6 +2,7 @@ import asyncio
 import uuid
 import json
 import jsonschema
+import litellm
 import structlog
 from app.agents.builder import AgentConfig
 from app.agents.tools import run_tool, to_openai_tools, _supports_native_tools, _tool_schemas, _invoke_stack
@@ -9,7 +10,7 @@ from app.context.models import AgentContext, ContextualData
 from app.context.store import save_context
 from app.rag.retriever import retrieve
 from app.config import get_settings
-from app.llm.pii import scrub_pii
+from app.llm.pii import scrub_pii_async
 from app.llm.router import call_llm_with_retry
 from app.observability.metrics import active_agent_runs, agent_runs_total
 
@@ -25,6 +26,33 @@ LLM_PER_CALL_TIMEOUT = 120  # 120 seconds per LLM call
 
 _MAX_TOOL_RESULT_CHARS = 8_000
 _MAX_SCHEMA_CORRECTIONS = 2
+_CONTEXT_WINDOW_SAFETY_MARGIN = 0.9
+
+
+def _context_window_for(model: str) -> int | None:
+    try:
+        info = litellm.get_model_info(model)
+        return info.get("max_input_tokens") or info.get("max_tokens")
+    except Exception:
+        return None
+
+
+def _trim_messages_to_fit(messages: list[dict], model: str, max_response_tokens: int, bound_log) -> list[dict]:
+    """Drop oldest non-system messages if the prompt would exceed the model's context window."""
+    limit = _context_window_for(model)
+    if not limit:
+        return messages
+    budget = int(limit * _CONTEXT_WINDOW_SAFETY_MARGIN) - max_response_tokens
+    while len(messages) > 2:
+        try:
+            count = litellm.token_counter(model=model, messages=messages)
+        except Exception:
+            return messages
+        if count <= budget:
+            return messages
+        bound_log.warning("context_window_trim", token_count=count, budget=budget, model=model)
+        messages.pop(1)  # drop oldest non-system message
+    return messages
 
 TOOL_CALL_PROMPT = """Available tools (respond ONLY with JSON):
 {tools}
@@ -158,7 +186,7 @@ async def _run_agent_inner(
                     f"[{i+1}] {r['document']} (score: {r['score']})"
                     for i, r in enumerate(retrieved)
                 )
-                clean_text, pii_found = scrub_pii(raw_text)
+                clean_text, pii_found = await scrub_pii_async(raw_text)
                 if pii_found:
                     bound_log.warning("rag_context_pii_scrubbed")
                     pii_detected = True
@@ -178,7 +206,7 @@ async def _run_agent_inner(
 
     if extra_context:
         context_str = json.dumps(extra_context)
-        clean_context, pii_found = scrub_pii(context_str)
+        clean_context, pii_found = await scrub_pii_async(context_str)
         pii_detected = pii_detected or pii_found
         if pii_found:
             bound_log.warning("agent_context_pii_scrubbed")
@@ -228,6 +256,8 @@ async def _run_agent_inner(
         if use_native and allowed_schemas:
             call_kwargs["tools"] = to_openai_tools(allowed_schemas)
             call_kwargs["tool_choice"] = "auto"
+
+        messages = _trim_messages_to_fit(messages, config.model, config.max_response_tokens, bound_log)
 
         try:
             response = await asyncio.wait_for(

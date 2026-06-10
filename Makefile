@@ -1,7 +1,13 @@
-.PHONY: test migrate backfill-rag migrations docker-build docker-up docker-up-d ollama-pull docker-down docker-logs docker-restart docker-rebuild dev dev-d dev-down dev-rebuild
+.PHONY: test lint typecheck migrate backfill-rag migrations docker-build docker-up docker-up-d ollama-pull docker-down docker-logs docker-restart docker-rebuild dev dev-d dev-down dev-rebuild
 
 test:
 	uv run python -m pytest tests/ -v
+
+lint:
+	uv run ruff check .
+
+typecheck:
+	uv run mypy app
 
 migrate:
 	uv run alembic upgrade head

@@ -28,14 +28,14 @@ def make_agent_config() -> AgentConfig:
 # ── POST /automation/trigger/{agent_id} ───────────────────────────────────────
 
 def test_trigger_requires_auth(client):
-    resp = client.post("/automation/trigger/test-agent")
+    resp = client.post("/v1/automation/trigger/test-agent")
     assert resp.status_code == 401
 
 
 def test_trigger_viewer_blocked(client, engine):
     seed_user(engine, "viewer1", "viewer")
     token = get_token(client, "viewer1")
-    resp = client.post("/automation/trigger/test-agent", headers=auth_header(token))
+    resp = client.post("/v1/automation/trigger/test-agent", headers=auth_header(token))
     assert resp.status_code == 403
 
 
@@ -43,7 +43,7 @@ def test_trigger_unknown_agent_returns_404(client, engine):
     seed_user(engine, "analyst1", "analyst")
     token = get_token(client, "analyst1")
     with patch("app.automation.router.get_agent", side_effect=KeyError("test-agent")):
-        resp = client.post("/automation/trigger/missing-agent", headers=auth_header(token))
+        resp = client.post("/v1/automation/trigger/missing-agent", headers=auth_header(token))
     assert resp.status_code == 404
 
 
@@ -52,7 +52,7 @@ def test_trigger_analyst_queues_agent(client, engine):
     token = get_token(client, "analyst2")
     with patch("app.automation.router.get_agent", return_value=make_agent_config()), \
          patch("app.automation.router._run_workflow", new=AsyncMock(return_value=None)):
-        resp = client.post("/automation/trigger/test-agent", headers=auth_header(token))
+        resp = client.post("/v1/automation/trigger/test-agent", headers=auth_header(token))
     assert resp.status_code == 202
     body = resp.json()
     assert body["status"] == "queued"
@@ -73,7 +73,7 @@ def test_trigger_admin_can_trigger(client, engine):
     token = get_token(client, "admin1")
     with patch("app.automation.router.get_agent", return_value=make_agent_config()), \
          patch("app.automation.router._run_workflow", new=AsyncMock(return_value=None)):
-        resp = client.post("/automation/trigger/test-agent", headers=auth_header(token))
+        resp = client.post("/v1/automation/trigger/test-agent", headers=auth_header(token))
     assert resp.status_code == 202
 
 
@@ -92,21 +92,21 @@ def seed_workflow(engine, agent_id: str, status: str) -> int:
 # ── GET /automation/workflows/{id}/stream ─────────────────────────────────────
 
 def test_stream_requires_auth(client):
-    resp = client.get("/automation/workflows/999/stream")
+    resp = client.get("/v1/automation/workflows/999/stream")
     assert resp.status_code == 401
 
 
 def test_stream_viewer_blocked(client, engine):
     seed_user(engine, "vstream", "viewer")
     token = get_token(client, "vstream")
-    resp = client.get("/automation/workflows/999/stream", headers=auth_header(token))
+    resp = client.get("/v1/automation/workflows/999/stream", headers=auth_header(token))
     assert resp.status_code == 403
 
 
 def test_stream_not_found(client, engine):
     seed_user(engine, "astream_nf", "analyst")
     token = get_token(client, "astream_nf")
-    with client.stream("GET", "/automation/workflows/99999/stream",
+    with client.stream("GET", "/v1/automation/workflows/99999/stream",
                        headers=auth_header(token)) as resp:
         body = resp.read().decode()
     assert '"type": "error"' in body
@@ -116,7 +116,7 @@ def test_stream_already_completed(client, engine):
     seed_user(engine, "astream_done", "analyst")
     token = get_token(client, "astream_done")
     wf_id = seed_workflow(engine, "test-agent", "completed")
-    with client.stream("GET", f"/automation/workflows/{wf_id}/stream",
+    with client.stream("GET", f"/v1/automation/workflows/{wf_id}/stream",
                        headers=auth_header(token)) as resp:
         body = resp.read().decode()
     assert '"type": "status"' in body
@@ -149,7 +149,7 @@ def test_stream_redis_emits_per_iteration_events(client, engine):
 
     with patch("app.automation.router.pubsub.is_available", return_value=True), \
          patch("app.automation.router.pubsub.subscribe_workflow", side_effect=fake_subscribe):
-        with client.stream("GET", f"/automation/workflows/{wf_id}/stream",
+        with client.stream("GET", f"/v1/automation/workflows/{wf_id}/stream",
                            headers=auth_header(token)) as resp:
             body = resp.read().decode()
 
@@ -182,7 +182,7 @@ def test_stream_db_poll_fallback_detects_transition(client, engine):
     # Redis not available → falls through to DB polling path
     with patch("app.automation.router.pubsub.is_available", return_value=False), \
          patch("app.automation.router.asyncio.sleep", side_effect=flip_on_first_sleep):
-        with client.stream("GET", f"/automation/workflows/{wf_id}/stream",
+        with client.stream("GET", f"/v1/automation/workflows/{wf_id}/stream",
                            headers=auth_header(token)) as resp:
             body = resp.read().decode()
 
@@ -230,19 +230,19 @@ def seed_run_log(
 # ── GET /automation/runs ──────────────────────────────────────────────────────
 
 def test_list_runs_requires_auth(client):
-    assert client.get("/automation/runs").status_code == 401
+    assert client.get("/v1/automation/runs").status_code == 401
 
 
 def test_list_runs_viewer_blocked(client, engine):
     seed_user(engine, "vr_runs", "viewer")
     token = get_token(client, "vr_runs")
-    assert client.get("/automation/runs", headers=auth_header(token)).status_code == 403
+    assert client.get("/v1/automation/runs", headers=auth_header(token)).status_code == 403
 
 
 def test_list_runs_empty(client, engine):
     seed_user(engine, "ar_empty", "analyst")
     token = get_token(client, "ar_empty")
-    resp = client.get("/automation/runs", headers=auth_header(token))
+    resp = client.get("/v1/automation/runs", headers=auth_header(token))
     assert resp.status_code == 200
     assert resp.json() == []
 
@@ -251,7 +251,7 @@ def test_list_runs_returns_seeded_run(client, engine):
     seed_user(engine, "ar_basic", "analyst")
     token = get_token(client, "ar_basic")
     run_id = seed_run_log(engine, agent_id="my-agent", outcome="success")
-    resp = client.get("/automation/runs", headers=auth_header(token))
+    resp = client.get("/v1/automation/runs", headers=auth_header(token))
     assert resp.status_code == 200
     data = resp.json()
     assert len(data) == 1
@@ -265,7 +265,7 @@ def test_list_runs_filter_by_agent_id(client, engine):
     token = get_token(client, "ar_agent")
     seed_run_log(engine, agent_id="agent-a")
     seed_run_log(engine, agent_id="agent-b")
-    resp = client.get("/automation/runs?agent_id=agent-a", headers=auth_header(token))
+    resp = client.get("/v1/automation/runs?agent_id=agent-a", headers=auth_header(token))
     assert resp.status_code == 200
     data = resp.json()
     assert len(data) == 1
@@ -277,7 +277,7 @@ def test_list_runs_filter_by_outcome(client, engine):
     token = get_token(client, "ar_outcome")
     seed_run_log(engine, outcome="success")
     seed_run_log(engine, outcome="error")
-    resp = client.get("/automation/runs?outcome=error", headers=auth_header(token))
+    resp = client.get("/v1/automation/runs?outcome=error", headers=auth_header(token))
     assert resp.status_code == 200
     data = resp.json()
     assert len(data) == 1
@@ -289,11 +289,11 @@ def test_list_runs_pagination(client, engine):
     token = get_token(client, "ar_page")
     for _ in range(5):
         seed_run_log(engine)
-    resp_all = client.get("/automation/runs?limit=5", headers=auth_header(token))
+    resp_all = client.get("/v1/automation/runs?limit=5", headers=auth_header(token))
     assert len(resp_all.json()) == 5
-    resp_page = client.get("/automation/runs?limit=2&offset=0", headers=auth_header(token))
+    resp_page = client.get("/v1/automation/runs?limit=2&offset=0", headers=auth_header(token))
     assert len(resp_page.json()) == 2
-    resp_offset = client.get("/automation/runs?limit=2&offset=4", headers=auth_header(token))
+    resp_offset = client.get("/v1/automation/runs?limit=2&offset=4", headers=auth_header(token))
     assert len(resp_offset.json()) == 1
 
 
@@ -301,7 +301,7 @@ def test_list_runs_tool_calls_parsed_as_list(client, engine):
     seed_user(engine, "ar_tools", "analyst")
     token = get_token(client, "ar_tools")
     seed_run_log(engine, tool_calls='[{"tool": "search_document", "success": true}]')
-    resp = client.get("/automation/runs", headers=auth_header(token))
+    resp = client.get("/v1/automation/runs", headers=auth_header(token))
     assert resp.status_code == 200
     tool_calls = resp.json()[0]["tool_calls"]
     assert isinstance(tool_calls, list)
@@ -312,7 +312,7 @@ def test_list_runs_tool_calls_malformed_json_returns_empty_list(client, engine):
     seed_user(engine, "ar_badtools", "analyst")
     token = get_token(client, "ar_badtools")
     seed_run_log(engine, tool_calls="not-valid-json")
-    resp = client.get("/automation/runs", headers=auth_header(token))
+    resp = client.get("/v1/automation/runs", headers=auth_header(token))
     assert resp.status_code == 200
     assert resp.json()[0]["tool_calls"] == []
 
@@ -323,7 +323,7 @@ def test_list_runs_duration_seconds_computed(client, engine):
     started = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
     completed = datetime(2026, 1, 1, 10, 0, 45, tzinfo=timezone.utc)
     seed_run_log(engine, started_at=started, completed_at=completed)
-    resp = client.get("/automation/runs", headers=auth_header(token))
+    resp = client.get("/v1/automation/runs", headers=auth_header(token))
     assert resp.status_code == 200
     assert resp.json()[0]["duration_seconds"] == 45.0
 
@@ -334,7 +334,7 @@ def test_list_runs_date_range_filter(client, engine):
     seed_run_log(engine, started_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
     seed_run_log(engine, started_at=datetime(2026, 3, 1, tzinfo=timezone.utc))
     resp = client.get(
-        "/automation/runs?from_date=2026-02-01T00:00:00Z&to_date=2026-04-01T00:00:00Z",
+        "/v1/automation/runs?from_date=2026-02-01T00:00:00Z&to_date=2026-04-01T00:00:00Z",
         headers=auth_header(token),
     )
     assert resp.status_code == 200
@@ -346,19 +346,19 @@ def test_list_runs_date_range_filter(client, engine):
 # ── GET /automation/runs/{run_id} ─────────────────────────────────────────────
 
 def test_get_run_requires_auth(client):
-    assert client.get("/automation/runs/some-run-id").status_code == 401
+    assert client.get("/v1/automation/runs/some-run-id").status_code == 401
 
 
 def test_get_run_viewer_blocked(client, engine):
     seed_user(engine, "vr_run_id", "viewer")
     token = get_token(client, "vr_run_id")
-    assert client.get("/automation/runs/x", headers=auth_header(token)).status_code == 403
+    assert client.get("/v1/automation/runs/x", headers=auth_header(token)).status_code == 403
 
 
 def test_get_run_not_found(client, engine):
     seed_user(engine, "ar_nf", "analyst")
     token = get_token(client, "ar_nf")
-    resp = client.get(f"/automation/runs/{uuid.uuid4()}", headers=auth_header(token))
+    resp = client.get(f"/v1/automation/runs/{uuid.uuid4()}", headers=auth_header(token))
     assert resp.status_code == 404
 
 
@@ -366,7 +366,7 @@ def test_get_run_returns_correct_run(client, engine):
     seed_user(engine, "ar_get", "analyst")
     token = get_token(client, "ar_get")
     run_id = seed_run_log(engine, agent_id="target-agent", outcome="timeout")
-    resp = client.get(f"/automation/runs/{run_id}", headers=auth_header(token))
+    resp = client.get(f"/v1/automation/runs/{run_id}", headers=auth_header(token))
     assert resp.status_code == 200
     data = resp.json()
     assert data["run_id"] == run_id
@@ -397,19 +397,19 @@ def sign(body: bytes, secret: str = _WEBHOOK_SECRET) -> str:
 
 def test_webhook_agent_not_found(client):
     with patch("app.automation.router.get_agent", side_effect=KeyError("no-agent")):
-        resp = client.post("/automation/webhooks/no-agent", content=b"{}")
+        resp = client.post("/v1/automation/webhooks/no-agent", content=b"{}")
     assert resp.status_code == 404
 
 
 def test_webhook_not_enabled(client):
     with patch("app.automation.router.get_agent", return_value=make_agent_no_webhook()):
-        resp = client.post("/automation/webhooks/test-agent", content=b"{}")
+        resp = client.post("/v1/automation/webhooks/test-agent", content=b"{}")
     assert resp.status_code == 403
 
 
 def test_webhook_missing_signature(client):
     with patch("app.automation.router.get_agent", return_value=make_agent_with_webhook()):
-        resp = client.post("/automation/webhooks/test-agent", content=b'{"x": 1}')
+        resp = client.post("/v1/automation/webhooks/test-agent", content=b'{"x": 1}')
     assert resp.status_code == 401
     assert "Missing" in resp.json()["detail"]
 
@@ -418,7 +418,7 @@ def test_webhook_invalid_signature(client):
     body = b'{"x": 1}'
     with patch("app.automation.router.get_agent", return_value=make_agent_with_webhook()):
         resp = client.post(
-            "/automation/webhooks/test-agent",
+            "/v1/automation/webhooks/test-agent",
             content=body,
             headers={"X-Actus-Signature": "sha256=badhash"},
         )
@@ -432,7 +432,7 @@ def test_webhook_valid_queues_run(client, engine):
     with patch("app.automation.router.get_agent", return_value=make_agent_with_webhook()), \
          patch("app.automation.router._run_workflow", new=AsyncMock(return_value=None)):
         resp = client.post(
-            "/automation/webhooks/test-agent",
+            "/v1/automation/webhooks/test-agent",
             content=body,
             headers={"X-Actus-Signature": sig},
         )
@@ -449,7 +449,7 @@ def test_webhook_json_body_becomes_extra_context(client, engine):
     with patch("app.automation.router.get_agent", return_value=make_agent_with_webhook()), \
          patch("app.automation.router._run_workflow", new=AsyncMock(return_value=None)):
         resp = client.post(
-            "/automation/webhooks/test-agent",
+            "/v1/automation/webhooks/test-agent",
             content=body,
             headers={"X-Actus-Signature": sig},
         )
@@ -468,7 +468,7 @@ def test_webhook_non_dict_json_wrapped(client, engine):
     with patch("app.automation.router.get_agent", return_value=make_agent_with_webhook()), \
          patch("app.automation.router._run_workflow", new=AsyncMock(return_value=None)):
         resp = client.post(
-            "/automation/webhooks/test-agent",
+            "/v1/automation/webhooks/test-agent",
             content=body,
             headers={"X-Actus-Signature": sig},
         )
@@ -487,7 +487,7 @@ def test_webhook_non_json_body_wrapped(client, engine):
     with patch("app.automation.router.get_agent", return_value=make_agent_with_webhook()), \
          patch("app.automation.router._run_workflow", new=AsyncMock(return_value=None)):
         resp = client.post(
-            "/automation/webhooks/test-agent",
+            "/v1/automation/webhooks/test-agent",
             content=body,
             headers={"X-Actus-Signature": sig},
         )
@@ -505,7 +505,7 @@ def test_webhook_oversized_body_rejected(client):
     sig = sign(body)
     with patch("app.automation.router.get_agent", return_value=make_agent_with_webhook()):
         resp = client.post(
-            "/automation/webhooks/test-agent",
+            "/v1/automation/webhooks/test-agent",
             content=body,
             headers={"X-Actus-Signature": sig},
         )
@@ -518,7 +518,7 @@ def test_webhook_github_header_accepted(client, engine):
     with patch("app.automation.router.get_agent", return_value=make_agent_with_webhook()), \
          patch("app.automation.router._run_workflow", new=AsyncMock(return_value=None)):
         resp = client.post(
-            "/automation/webhooks/test-agent",
+            "/v1/automation/webhooks/test-agent",
             content=body,
             headers={"X-Hub-Signature-256": sig},   # GitHub's header name
         )
@@ -622,7 +622,7 @@ def test_analyst_sees_own_workflows_only(client, engine):
     seed_workflow_full(engine, created_by=user1.id, status="completed")
     seed_workflow_full(engine, created_by=user2.id, status="completed")
 
-    resp = client.get("/automation/workflows", headers=auth_header(token1))
+    resp = client.get("/v1/automation/workflows", headers=auth_header(token1))
     assert resp.status_code == 200
     data = resp.json()
     assert len(data) == 1
@@ -636,7 +636,7 @@ def test_analyst_sees_webhook_triggered_workflows(client, engine):
     # created_by=None means webhook/scheduled — visible to all analysts
     seed_workflow_full(engine, created_by=None, status="completed")
 
-    resp = client.get("/automation/workflows", headers=auth_header(token1))
+    resp = client.get("/v1/automation/workflows", headers=auth_header(token1))
     assert resp.status_code == 200
     assert len(resp.json()) == 1
 
@@ -648,7 +648,7 @@ def test_analyst_cannot_see_other_analysts_workflow(client, engine):
 
     wf_id = seed_workflow_full(engine, created_by=user2.id, status="completed")
 
-    resp = client.get(f"/automation/workflows/{wf_id}", headers=auth_header(token1))
+    resp = client.get(f"/v1/automation/workflows/{wf_id}", headers=auth_header(token1))
     assert resp.status_code == 404
 
 
@@ -661,7 +661,7 @@ def test_admin_sees_all_workflows(client, engine):
     seed_workflow_full(engine, created_by=user1.id, status="completed")
     seed_workflow_full(engine, created_by=user2.id, status="completed")
 
-    resp = client.get("/automation/workflows", headers=auth_header(token_admin))
+    resp = client.get("/v1/automation/workflows", headers=auth_header(token_admin))
     assert resp.status_code == 200
     assert len(resp.json()) == 2
 
@@ -676,7 +676,7 @@ def test_analyst_sees_own_runs_only(client, engine):
     seed_run_log(engine, triggered_by=user1.id)
     seed_run_log(engine, triggered_by=user2.id)
 
-    resp = client.get("/automation/runs", headers=auth_header(token1))
+    resp = client.get("/v1/automation/runs", headers=auth_header(token1))
     assert resp.status_code == 200
     data = resp.json()
     assert len(data) == 1
@@ -689,7 +689,7 @@ def test_analyst_sees_webhook_triggered_runs(client, engine):
 
     seed_run_log(engine, triggered_by=None)
 
-    resp = client.get("/automation/runs", headers=auth_header(token1))
+    resp = client.get("/v1/automation/runs", headers=auth_header(token1))
     assert resp.status_code == 200
     assert len(resp.json()) == 1
 
@@ -701,7 +701,7 @@ def test_analyst_cannot_see_other_analysts_run(client, engine):
 
     run_id = seed_run_log(engine, triggered_by=user2.id)
 
-    resp = client.get(f"/automation/runs/{run_id}", headers=auth_header(token1))
+    resp = client.get(f"/v1/automation/runs/{run_id}", headers=auth_header(token1))
     assert resp.status_code == 404
 
 
@@ -714,7 +714,7 @@ def test_admin_sees_all_runs(client, engine):
     seed_run_log(engine, triggered_by=user1.id)
     seed_run_log(engine, triggered_by=user2.id)
 
-    resp = client.get("/automation/runs", headers=auth_header(token_admin))
+    resp = client.get("/v1/automation/runs", headers=auth_header(token_admin))
     assert resp.status_code == 200
     assert len(resp.json()) == 2
 
@@ -741,14 +741,14 @@ def seed_run_with_trace(engine, triggered_by: int | None = None, trace: list | N
 
 def test_trace_endpoint_requires_auth(client, engine):
     run_id = seed_run_with_trace(engine)
-    resp = client.get(f"/automation/runs/{run_id}/trace")
+    resp = client.get(f"/v1/automation/runs/{run_id}/trace")
     assert resp.status_code == 401
 
 
 def test_trace_endpoint_not_found(client, engine):
     seed_user(engine, "trace_analyst", "analyst")
     token = get_token(client, "trace_analyst")
-    resp = client.get("/automation/runs/no-such-run/trace", headers=auth_header(token))
+    resp = client.get("/v1/automation/runs/no-such-run/trace", headers=auth_header(token))
     assert resp.status_code == 404
 
 
@@ -756,7 +756,7 @@ def test_trace_endpoint_no_trace(client, engine):
     user = seed_user(engine, "trace_none", "analyst")
     token = get_token(client, "trace_none")
     run_id = seed_run_with_trace(engine, triggered_by=user.id, trace=None)
-    resp = client.get(f"/automation/runs/{run_id}/trace", headers=auth_header(token))
+    resp = client.get(f"/v1/automation/runs/{run_id}/trace", headers=auth_header(token))
     assert resp.status_code == 200
     data = resp.json()
     assert data["trace_available"] is False
@@ -773,7 +773,7 @@ def test_trace_endpoint_returns_iterations(client, engine):
          "tokens_this_iteration": 60, "system_prompt_preview": "you are an agent"},
     ]
     run_id = seed_run_with_trace(engine, triggered_by=user.id, trace=trace)
-    resp = client.get(f"/automation/runs/{run_id}/trace", headers=auth_header(token))
+    resp = client.get(f"/v1/automation/runs/{run_id}/trace", headers=auth_header(token))
     assert resp.status_code == 200
     data = resp.json()
     assert data["trace_available"] is True
@@ -787,7 +787,7 @@ def test_trace_endpoint_analyst_cannot_see_others_trace(client, engine):
     user2 = seed_user(engine, "trace_other", "analyst")
     token1 = get_token(client, "trace_own")
     run_id = seed_run_with_trace(engine, triggered_by=user2.id, trace=[])
-    resp = client.get(f"/automation/runs/{run_id}/trace", headers=auth_header(token1))
+    resp = client.get(f"/v1/automation/runs/{run_id}/trace", headers=auth_header(token1))
     assert resp.status_code == 404
 
 
@@ -833,7 +833,7 @@ def test_get_workflow_wrong_team_returns_404(client, engine):
         session.add(wf)
         session.commit()
 
-    resp = client.get(f"/automation/workflows/{wf_id}", headers=auth_header(token1))
+    resp = client.get(f"/v1/automation/workflows/{wf_id}", headers=auth_header(token1))
     assert resp.status_code == 404
 
 
@@ -855,7 +855,7 @@ def test_get_run_wrong_team_returns_404(client, engine):
         session.add(run)
         session.commit()
 
-    resp = client.get(f"/automation/runs/{run_id}", headers=auth_header(token1))
+    resp = client.get(f"/v1/automation/runs/{run_id}", headers=auth_header(token1))
     assert resp.status_code == 404
 
 
@@ -875,7 +875,7 @@ def test_stream_wrong_team_yields_error_event(client, engine):
         session.add(wf)
         session.commit()
 
-    with client.stream("GET", f"/automation/workflows/{wf_id}/stream",
+    with client.stream("GET", f"/v1/automation/workflows/{wf_id}/stream",
                        headers=auth_header(token1)) as resp:
         body = resp.read().decode()
     assert '"type": "error"' in body
@@ -892,7 +892,7 @@ def test_trace_endpoint_handles_old_list_format(client, engine):
         {"iteration": 0, "tool_call": {"name": "search"}, "tool_result": {"success": True}},
     ]
     run_id = seed_run_with_trace(engine, triggered_by=user.id, trace=old_format_trace)
-    resp = client.get(f"/automation/runs/{run_id}/trace", headers=auth_header(token))
+    resp = client.get(f"/v1/automation/runs/{run_id}/trace", headers=auth_header(token))
     assert resp.status_code == 200
     data = resp.json()
     assert data["trace_available"] is True
@@ -904,7 +904,7 @@ def test_run_response_does_not_include_ip_address(client, engine):
     seed_user(engine, "no_ip", "analyst")
     token = get_token(client, "no_ip")
     seed_run_log(engine)
-    resp = client.get("/automation/runs", headers=auth_header(token))
+    resp = client.get("/v1/automation/runs", headers=auth_header(token))
     assert resp.status_code == 200
     assert len(resp.json()) > 0
     assert "ip_address" not in resp.json()[0]
@@ -915,7 +915,7 @@ def test_run_response_does_not_include_ip_address(client, engine):
 def test_create_team_requires_admin(client, engine):
     seed_user(engine, "team_analyst", "analyst")
     token = get_token(client, "team_analyst")
-    resp = client.post("/auth/teams", json={"name": "Engineering"},
+    resp = client.post("/v1/auth/teams", json={"name": "Engineering"},
                        headers=auth_header(token))
     assert resp.status_code == 403
 
@@ -923,7 +923,7 @@ def test_create_team_requires_admin(client, engine):
 def test_create_team_success(client, engine):
     seed_user(engine, "team_admin", "admin")
     token = get_token(client, "team_admin")
-    resp = client.post("/auth/teams", json={"name": "Engineering"},
+    resp = client.post("/v1/auth/teams", json={"name": "Engineering"},
                        headers=auth_header(token))
     assert resp.status_code == 201
     data = resp.json()
@@ -934,24 +934,24 @@ def test_create_team_success(client, engine):
 def test_create_team_duplicate_name(client, engine):
     seed_user(engine, "team_admin2", "admin")
     token = get_token(client, "team_admin2")
-    client.post("/auth/teams", json={"name": "Sales"}, headers=auth_header(token))
-    resp = client.post("/auth/teams", json={"name": "Sales"}, headers=auth_header(token))
+    client.post("/v1/auth/teams", json={"name": "Sales"}, headers=auth_header(token))
+    resp = client.post("/v1/auth/teams", json={"name": "Sales"}, headers=auth_header(token))
     assert resp.status_code == 409
 
 
 def test_list_teams_requires_admin(client, engine):
     seed_user(engine, "team_viewer", "viewer")
     token = get_token(client, "team_viewer")
-    resp = client.get("/auth/teams", headers=auth_header(token))
+    resp = client.get("/v1/auth/teams", headers=auth_header(token))
     assert resp.status_code == 403
 
 
 def test_list_teams(client, engine):
     seed_user(engine, "team_adm_list", "admin")
     token = get_token(client, "team_adm_list")
-    client.post("/auth/teams", json={"name": "Alpha"}, headers=auth_header(token))
-    client.post("/auth/teams", json={"name": "Beta"}, headers=auth_header(token))
-    resp = client.get("/auth/teams", headers=auth_header(token))
+    client.post("/v1/auth/teams", json={"name": "Alpha"}, headers=auth_header(token))
+    client.post("/v1/auth/teams", json={"name": "Beta"}, headers=auth_header(token))
+    resp = client.get("/v1/auth/teams", headers=auth_header(token))
     assert resp.status_code == 200
     names = [t["name"] for t in resp.json()]
     assert "Alpha" in names and "Beta" in names
@@ -962,10 +962,10 @@ def test_assign_team_to_user(client, engine):
     analyst = seed_user(engine, "team_user_assign", "analyst")
     token = get_token(client, "team_adm_assign")
     # create team
-    resp = client.post("/auth/teams", json={"name": "Ops"}, headers=auth_header(token))
+    resp = client.post("/v1/auth/teams", json={"name": "Ops"}, headers=auth_header(token))
     team_id = resp.json()["id"]
     # assign user
-    resp = client.patch(f"/auth/users/{analyst.id}/team",
+    resp = client.patch(f"/v1/auth/users/{analyst.id}/team",
                         json={"team_id": team_id}, headers=auth_header(token))
     assert resp.status_code == 200
     assert resp.json()["team_id"] == team_id
@@ -975,7 +975,7 @@ def test_assign_team_nonexistent_team(client, engine):
     admin = seed_user(engine, "team_adm_bad", "admin")
     analyst = seed_user(engine, "team_user_bad", "analyst")
     token = get_token(client, "team_adm_bad")
-    resp = client.patch(f"/auth/users/{analyst.id}/team",
+    resp = client.patch(f"/v1/auth/users/{analyst.id}/team",
                         json={"team_id": 99999}, headers=auth_header(token))
     assert resp.status_code == 404
 
@@ -985,12 +985,12 @@ def test_remove_team_from_user(client, engine):
     analyst = seed_user(engine, "team_user_rem", "analyst")
     token = get_token(client, "team_adm_rem")
     # create and assign
-    resp = client.post("/auth/teams", json={"name": "Finance"}, headers=auth_header(token))
+    resp = client.post("/v1/auth/teams", json={"name": "Finance"}, headers=auth_header(token))
     team_id = resp.json()["id"]
-    client.patch(f"/auth/users/{analyst.id}/team",
+    client.patch(f"/v1/auth/users/{analyst.id}/team",
                  json={"team_id": team_id}, headers=auth_header(token))
     # remove
-    resp = client.patch(f"/auth/users/{analyst.id}/team",
+    resp = client.patch(f"/v1/auth/users/{analyst.id}/team",
                         json={"team_id": None}, headers=auth_header(token))
     assert resp.status_code == 200
     assert resp.json()["team_id"] is None

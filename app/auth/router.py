@@ -2,12 +2,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, NoReturn
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
-from jose import JWTError, jwt
+import jwt
+from jwt import PyJWTError
 from app.config import get_settings
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import Session, select
 from app.database import get_session
-from app.auth.models import Team, User, VALID_ROLES, hash_password, verify_password
+from app.auth.models import Team, User, VALID_ROLES, hash_password_async, verify_password_async
 from app.auth.jwt import (
     create_access_token, create_refresh_token,
     get_current_user, require_role, write_audit_log,
@@ -94,7 +95,7 @@ async def register(
     if existing:
         raise HTTPException(status_code=409, detail="Username already taken")
 
-    user = User(username=req.username, hashed_password=hash_password(req.password), role="viewer")
+    user = User(username=req.username, hashed_password=await hash_password_async(req.password), role="viewer")
     try:
         session.add(user)
         session.commit()
@@ -145,7 +146,7 @@ async def login(
         write_audit_log(username=form.username, action="login", ip=ip, success=False, detail="account locked")
         raise HTTPException(status_code=403, detail="Account temporarily locked")
 
-    if not verify_password(form.password, user.hashed_password):
+    if not await verify_password_async(form.password, user.hashed_password):
         fail("wrong password")
 
     user.failed_login_count = 0
@@ -158,8 +159,8 @@ async def login(
     write_audit_log(username=user.username, action="login", ip=ip, success=True)
     log.info("user_logged_in", username=user.username)
     return TokenResponse(
-        access_token=create_access_token({"sub": user.username}),
-        refresh_token=create_refresh_token({"sub": user.username}),
+        access_token=create_access_token({"sub": user.username, "tv": user.token_version}),
+        refresh_token=create_refresh_token({"sub": user.username, "tv": user.token_version}),
     )
 
 
@@ -184,7 +185,8 @@ async def refresh(req: RefreshRequest, session: Session = Depends(get_session)):
             raise exc
         old_jti: str | None = payload.get("jti")
         old_exp: int = payload.get("exp", 0)
-    except JWTError:
+        token_version = payload.get("tv", 0)
+    except PyJWTError:
         raise exc
 
     if old_jti and await _is_revoked(old_jti):
@@ -194,13 +196,16 @@ async def refresh(req: RefreshRequest, session: Session = Depends(get_session)):
     if not user or not user.is_active or user.is_locked():
         raise exc
 
+    if token_version != user.token_version:
+        raise exc
+
     if old_jti:
         old_ttl = max(0, int(old_exp - datetime.now(timezone.utc).timestamp()))
         await _revoke_token(old_jti, old_ttl)
 
     return TokenResponse(
-        access_token=create_access_token({"sub": user.username}),
-        refresh_token=create_refresh_token({"sub": user.username}),
+        access_token=create_access_token({"sub": user.username, "tv": user.token_version}),
+        refresh_token=create_refresh_token({"sub": user.username, "tv": user.token_version}),
     )
 
 
@@ -217,7 +222,7 @@ async def logout(
         ttl = max(0, int(exp - datetime.now(timezone.utc).timestamp()))
         if jti and ttl > 0:
             await _revoke_token(jti, ttl)
-    except JWTError:
+    except PyJWTError:
         pass
     write_audit_log(username=user.username, action="logout", success=True)
 
@@ -239,6 +244,7 @@ async def assign_role(
         raise HTTPException(status_code=404, detail="User not found")
 
     target.role = req.role
+    target.token_version += 1
     target.touch()
     session.add(target)
     session.commit()
@@ -276,6 +282,7 @@ async def delete_user(
         raise HTTPException(status_code=400, detail="Cannot delete your own account")
 
     target.soft_delete(deleted_by=admin.id)
+    target.token_version += 1
     session.add(target)
     session.commit()
 
@@ -296,7 +303,8 @@ async def reset_password(
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
 
-    target.hashed_password = hash_password(req.new_password)
+    target.hashed_password = await hash_password_async(req.new_password)
+    target.token_version += 1
     target.touch()
     session.add(target)
     session.commit()

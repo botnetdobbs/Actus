@@ -1,3 +1,4 @@
+import asyncio
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
 import structlog
@@ -23,3 +24,7 @@ def scrub_pii(text: str, language: str = "en") -> tuple[str, bool]:
     )
     anonymized = _anonymizer.anonymize(text=text, analyzer_results=results)  # pyright: ignore[reportArgumentType]
     return anonymized.text, True
+
+
+async def scrub_pii_async(text: str, language: str = "en") -> tuple[str, bool]:
+    return await asyncio.get_running_loop().run_in_executor(None, scrub_pii, text, language)

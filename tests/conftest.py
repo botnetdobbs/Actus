@@ -60,6 +60,6 @@ def seed_user(engine, username: str, role: str, password: str = "testpass") -> U
 
 
 def get_token(client: TestClient, username: str, password: str = "testpass") -> str:
-    resp = client.post("/auth/login", data={"username": username, "password": password})
+    resp = client.post("/v1/auth/login", data={"username": username, "password": password})
     assert resp.status_code == 200, f"Login failed for {username!r}: {resp.json()}"
     return resp.json()["access_token"]

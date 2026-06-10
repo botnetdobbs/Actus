@@ -241,7 +241,7 @@ def test_healthz_reports_redis_error_on_ping_failure(client):
 
 def test_login_returns_refresh_token(client, engine):
     seed_user(engine, "alice_refresh", "viewer")
-    resp = client.post("/auth/login", data={"username": "alice_refresh", "password": "testpass"})
+    resp = client.post("/v1/auth/login", data={"username": "alice_refresh", "password": "testpass"})
     assert resp.status_code == 200
     body = resp.json()
     assert "access_token" in body
@@ -251,10 +251,10 @@ def test_login_returns_refresh_token(client, engine):
 
 def test_refresh_endpoint_returns_new_tokens(client, engine):
     seed_user(engine, "bob_refresh", "viewer")
-    login_resp = client.post("/auth/login", data={"username": "bob_refresh", "password": "testpass"})
+    login_resp = client.post("/v1/auth/login", data={"username": "bob_refresh", "password": "testpass"})
     refresh_token = login_resp.json()["refresh_token"]
 
-    resp = client.post("/auth/refresh", json={"refresh_token": refresh_token})
+    resp = client.post("/v1/auth/refresh", json={"refresh_token": refresh_token})
     assert resp.status_code == 200
     body = resp.json()
     assert "access_token" in body
@@ -263,28 +263,28 @@ def test_refresh_endpoint_returns_new_tokens(client, engine):
 
 def test_refresh_new_access_token_is_valid(client, engine):
     seed_user(engine, "carol_refresh", "viewer")
-    login_resp = client.post("/auth/login", data={"username": "carol_refresh", "password": "testpass"})
+    login_resp = client.post("/v1/auth/login", data={"username": "carol_refresh", "password": "testpass"})
     refresh_token = login_resp.json()["refresh_token"]
 
-    refresh_resp = client.post("/auth/refresh", json={"refresh_token": refresh_token})
+    refresh_resp = client.post("/v1/auth/refresh", json={"refresh_token": refresh_token})
     new_access = refresh_resp.json()["access_token"]
 
-    me_resp = client.get("/auth/me", headers=auth_header(new_access))
+    me_resp = client.get("/v1/auth/me", headers=auth_header(new_access))
     assert me_resp.status_code == 200
     assert me_resp.json()["username"] == "carol_refresh"
 
 
 def test_refresh_rejects_access_token_as_refresh(client, engine):
     seed_user(engine, "dave_refresh", "viewer")
-    login_resp = client.post("/auth/login", data={"username": "dave_refresh", "password": "testpass"})
+    login_resp = client.post("/v1/auth/login", data={"username": "dave_refresh", "password": "testpass"})
     access_token = login_resp.json()["access_token"]
 
-    resp = client.post("/auth/refresh", json={"refresh_token": access_token})
+    resp = client.post("/v1/auth/refresh", json={"refresh_token": access_token})
     assert resp.status_code == 401
 
 
 def test_refresh_rejects_expired_or_invalid_token(client):
-    resp = client.post("/auth/refresh", json={"refresh_token": "not.a.real.token"})
+    resp = client.post("/v1/auth/refresh", json={"refresh_token": "not.a.real.token"})
     assert resp.status_code == 401
 
 
@@ -293,7 +293,7 @@ def test_refresh_rejects_inactive_user(client, engine):
     from sqlmodel import select
 
     seed_user(engine, "eve_refresh", "viewer")
-    login_resp = client.post("/auth/login", data={"username": "eve_refresh", "password": "testpass"})
+    login_resp = client.post("/v1/auth/login", data={"username": "eve_refresh", "password": "testpass"})
     refresh_token = login_resp.json()["refresh_token"]
 
     with Session(engine) as session:
@@ -302,7 +302,7 @@ def test_refresh_rejects_inactive_user(client, engine):
         session.add(u)
         session.commit()
 
-    resp = client.post("/auth/refresh", json={"refresh_token": refresh_token})
+    resp = client.post("/v1/auth/refresh", json={"refresh_token": refresh_token})
     assert resp.status_code == 401
 
 
@@ -326,7 +326,7 @@ def _make_mock_redis() -> tuple[MagicMock, set]:
 
 
 def test_logout_requires_auth(client):
-    resp = client.post("/auth/logout")
+    resp = client.post("/v1/auth/logout")
     assert resp.status_code == 401
 
 
@@ -334,7 +334,7 @@ def test_logout_returns_204(client, engine):
     seed_user(engine, "frank_logout", "viewer")
     token = get_token(client, "frank_logout")
 
-    resp = client.post("/auth/logout", headers=auth_header(token))
+    resp = client.post("/v1/auth/logout", headers=auth_header(token))
     assert resp.status_code == 204
 
 
@@ -344,10 +344,10 @@ def test_logout_revokes_token_when_redis_available(client, engine):
 
     mock_redis, revoked = _make_mock_redis()
     with patch("app.pubsub._redis", mock_redis):
-        resp = client.post("/auth/logout", headers=auth_header(token))
+        resp = client.post("/v1/auth/logout", headers=auth_header(token))
         assert resp.status_code == 204
 
-        resp = client.get("/auth/me", headers=auth_header(token))
+        resp = client.get("/v1/auth/me", headers=auth_header(token))
         assert resp.status_code == 401
 
 
@@ -356,39 +356,39 @@ def test_logout_no_redis_returns_204_without_revoking(client, engine):
     token = get_token(client, "henry_logout")
 
     with patch("app.pubsub._redis", None):
-        resp = client.post("/auth/logout", headers=auth_header(token))
+        resp = client.post("/v1/auth/logout", headers=auth_header(token))
         assert resp.status_code == 204
 
-    resp = client.get("/auth/me", headers=auth_header(token))
+    resp = client.get("/v1/auth/me", headers=auth_header(token))
     assert resp.status_code == 200
 
 
 def test_refresh_rotation_revokes_old_refresh_token(client, engine):
     seed_user(engine, "ivan_refresh", "viewer")
-    login_resp = client.post("/auth/login", data={"username": "ivan_refresh", "password": "testpass"})
+    login_resp = client.post("/v1/auth/login", data={"username": "ivan_refresh", "password": "testpass"})
     old_refresh = login_resp.json()["refresh_token"]
 
     mock_redis, revoked = _make_mock_redis()
     with patch("app.pubsub._redis", mock_redis):
         # Use old refresh token to get new tokens — rotation revokes old token
-        resp = client.post("/auth/refresh", json={"refresh_token": old_refresh})
+        resp = client.post("/v1/auth/refresh", json={"refresh_token": old_refresh})
         assert resp.status_code == 200
 
         # Old refresh token should now be revoked
-        resp = client.post("/auth/refresh", json={"refresh_token": old_refresh})
+        resp = client.post("/v1/auth/refresh", json={"refresh_token": old_refresh})
         assert resp.status_code == 401
 
 
 def test_new_refresh_token_still_works_after_rotation(client, engine):
     seed_user(engine, "judy_refresh", "viewer")
-    login_resp = client.post("/auth/login", data={"username": "judy_refresh", "password": "testpass"})
+    login_resp = client.post("/v1/auth/login", data={"username": "judy_refresh", "password": "testpass"})
     old_refresh = login_resp.json()["refresh_token"]
 
     mock_redis, revoked = _make_mock_redis()
     with patch("app.pubsub._redis", mock_redis):
-        rotate_resp = client.post("/auth/refresh", json={"refresh_token": old_refresh})
+        rotate_resp = client.post("/v1/auth/refresh", json={"refresh_token": old_refresh})
         new_refresh = rotate_resp.json()["refresh_token"]
 
         # New refresh token must still work
-        resp = client.post("/auth/refresh", json={"refresh_token": new_refresh})
+        resp = client.post("/v1/auth/refresh", json={"refresh_token": new_refresh})
         assert resp.status_code == 200

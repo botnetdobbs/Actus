@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import uuid as _uuid
-from jose import JWTError, jwt
+import jwt
+from jwt import PyJWTError
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlmodel import Session, select
@@ -13,7 +14,7 @@ log = structlog.get_logger()
 
 _settings = get_settings()
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/v1/auth/login")
 
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
@@ -73,10 +74,13 @@ async def get_current_user(
         jti: str | None = payload.get("jti")
         if jti and await _is_revoked(jti):
             raise exc
-    except JWTError:
+        token_version = payload.get("tv", 0)
+    except PyJWTError:
         raise exc
     user = session.exec(select(User).where(User.username == username, User.is_deleted == False)).first()
     if not user or not user.is_active:
+        raise exc
+    if token_version != user.token_version:
         raise exc
     if user.is_locked():
         raise HTTPException(status_code=403, detail="Account temporarily locked")
