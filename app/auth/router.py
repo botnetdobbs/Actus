@@ -6,7 +6,7 @@ import jwt
 from jwt import PyJWTError
 from app.config import get_settings
 from pydantic import BaseModel, ConfigDict
-from sqlmodel import Session, col, select
+from sqlmodel import Session, col, func, select
 from app.database import get_session
 from app.auth.models import Team, User, VALID_ROLES, hash_password_async, verify_password_async
 from app.auth.jwt import (
@@ -242,6 +242,14 @@ async def assign_role(
     ).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
+
+    if target.role == "admin" and req.role != "admin":
+        remaining = session.exec(
+            select(func.count()).select_from(User)
+            .where(User.role == "admin", User.id != target.id, col(User.is_deleted).is_(False))
+        ).one()
+        if remaining == 0:
+            raise HTTPException(status_code=400, detail="Cannot demote the last remaining admin")
 
     target.role = req.role
     target.token_version += 1

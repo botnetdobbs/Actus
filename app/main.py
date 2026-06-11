@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlmodel import Session, select
+from app.auth.jwt import get_current_user
 from app.config import get_settings
 from app.database import get_session
 from app.limiter import limiter
@@ -95,8 +96,10 @@ def create_app() -> FastAPI:
     v1 = APIRouter(prefix="/v1")
     v1.include_router(auth_router, prefix="/auth", tags=["Auth"])
     v1.include_router(automation_router, prefix="/automation", tags=["Automation"])
-    v1.include_router(llm_router, prefix="/llm", tags=["LLM"])
-    v1.include_router(ontology_router, prefix="/ontology", tags=["Ontology"])
+    v1.include_router(llm_router, prefix="/llm", tags=["LLM"],
+                      dependencies=[Depends(get_current_user)])
+    v1.include_router(ontology_router, prefix="/ontology", tags=["Ontology"],
+                      dependencies=[Depends(get_current_user)])
     discover_routers(v1)    # registers app/agents/*/router.py
     app.include_router(v1)
 

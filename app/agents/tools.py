@@ -12,8 +12,17 @@ log = structlog.get_logger()
 # Tracks active agents to detect cycles and cap nesting depth
 MAX_INVOKE_DEPTH = 5
 MAX_PARALLEL_AGENTS = 10
+_MAX_TOOL_ERROR_CHARS = 200
 _invoke_stack: contextvars.ContextVar[list[str]] = contextvars.ContextVar(
     "invoke_stack", default=[]
+)
+
+# run_agent uses this as the default for team_id. It means "no team_id was
+# given, so use whatever the parent run is using". This is different from
+# team_id=None, which means "this run is global/unscoped" on purpose.
+INHERIT_TEAM_ID: Any = object()
+_team_id_context: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "team_id_context", default=None
 )
 
 
@@ -90,8 +99,9 @@ async def run_tool(name: str, timeout_seconds: float = 30.0, **kwargs) -> ToolRe
             output = await asyncio.wait_for(fn(**kwargs), timeout=timeout_seconds)
         else:
             loop = asyncio.get_running_loop()
+            ctx = contextvars.copy_context()
             output = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: fn(**kwargs)),
+                loop.run_in_executor(None, lambda: ctx.run(fn, **kwargs)),
                 timeout=timeout_seconds,
             )
         duration_ms = (time.monotonic() - start) * 1000
@@ -106,7 +116,7 @@ async def run_tool(name: str, timeout_seconds: float = 30.0, **kwargs) -> ToolRe
     except Exception as e:
         log.error("tool_failed", tool=name, error=str(e), exc_info=True)
         return ToolResult(tool_name=name, success=False,
-                          output=None, error=str(e))
+                          output=None, error=str(e)[:_MAX_TOOL_ERROR_CHARS])
 
 
 def list_tools() -> list[dict]:
@@ -165,7 +175,8 @@ def _supports_native_tools(model: str) -> bool:
       "Search ontology objects by semantic similarity to a natural-language query")
 def semantic_search(query: str, type_name: str = "", top_k: int = 5) -> list[dict]:
     from app.rag.retriever import retrieve
-    return retrieve(query, type_name=type_name or None, top_k=top_k)
+    return retrieve(query, type_name=type_name or None, top_k=top_k,
+                     team_id=_team_id_context.get())
 
 
 @tool("invoke_agent",

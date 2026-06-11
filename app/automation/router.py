@@ -14,6 +14,7 @@ from app.agents.builder import get_agent, list_agents, reload_agents
 from app.agents.orchestrator import run_agent_with_timeout
 from app.auth.models import User
 from app.auth.jwt import require_role, write_audit_log
+from app.auth.visibility import apply_visibility, check_visibility
 from app.context.models import Workflow, WorkflowStatus
 from app.database import get_engine, get_session
 from app.limiter import limiter
@@ -71,31 +72,6 @@ class AgentRunTrace(BaseModel):
     iterations: list[dict]
 
 
-def _apply_visibility(query, user: User, *, team_col, owner_col):
-    """Scope a query to records the user is allowed to see.
-
-    - Users in a team: see own team's records + team-less global records (NULL team)
-    - Users without a team (non-admin): see own records + unowned webhook/scheduled records
-    - Global admin (no team): see everything
-    """
-    if user.team_id is not None:
-        return query.where((team_col == user.team_id) | (team_col == None))  # noqa: E711
-    if user.role != "admin":
-        return query.where((owner_col == user.id) | (owner_col == None))  # noqa: E711
-    return query  # global admin: see all
-
-
-def _check_visibility(record, user: User, *, team_id_attr: str, owner_id_attr: str) -> bool:
-    """Single source of truth for by-ID access control. Mirrors _apply_visibility logic."""
-    record_team = getattr(record, team_id_attr, None)
-    record_owner = getattr(record, owner_id_attr, None)
-    if user.team_id is not None:
-        return record_team == user.team_id or record_team is None
-    if user.role == "admin":
-        return True
-    return record_owner == user.id or record_owner is None
-
-
 async def _forward_to_redis(queue: asyncio.Queue, channel: str) -> None:
     """Read events from a local asyncio.Queue and publish them to Redis."""
     while True:
@@ -138,7 +114,8 @@ async def _run_workflow(workflow_id: int, triggered_by: int | None, ip_address: 
     try:
         config = get_agent(agent_id)
         extra_context = json.loads(extra_context_json) if extra_context_json else None
-        result = await run_agent_with_timeout(config, extra_context=extra_context, event_queue=queue)
+        result = await run_agent_with_timeout(config, extra_context=extra_context, event_queue=queue,
+                                               team_id=wf_team_id)
         status = WorkflowStatus.completed
         outcome = _OUTCOME_MAP.get(result.get("status", ""), "error")
     except Exception as e:
@@ -306,7 +283,7 @@ async def list_workflows(
     user: User = Depends(require_role("analyst")),
 ):
     query = select(Workflow)
-    query = _apply_visibility(query, user, team_col=Workflow.team_id, owner_col=Workflow.created_by)
+    query = apply_visibility(query, user, team_col=Workflow.team_id, owner_col=Workflow.created_by)
     if agent_id:
         query = query.where(Workflow.agent_id == agent_id)
     if status:
@@ -322,7 +299,7 @@ async def get_workflow(
     user: User = Depends(require_role("analyst")),
 ):
     wf = session.get(Workflow, workflow_id)
-    if not wf or not _check_visibility(wf, user, team_id_attr="team_id", owner_id_attr="created_by"):
+    if not wf or not check_visibility(wf, user, team_id_attr="team_id", owner_id_attr="created_by"):
         raise HTTPException(status_code=404, detail=f"Workflow {workflow_id} not found")
     return wf
 
@@ -339,7 +316,7 @@ async def stream_workflow(
         # Emit current status immediately from DB; also enforce visibility
         with Session(get_engine()) as session:
             db_wf = session.get(Workflow, workflow_id)
-            if db_wf is None or not _check_visibility(
+            if db_wf is None or not check_visibility(
                 db_wf, user, team_id_attr="team_id", owner_id_attr="created_by"
             ):
                 yield 'data: {"type": "error", "error": "Not found"}\n\n'
@@ -417,7 +394,7 @@ async def list_runs(
     user: User = Depends(require_role("analyst")),
 ):
     query = select(AgentRunLog).options(sa_defer(AgentRunLog.trace_json))  # type: ignore[arg-type]
-    query = _apply_visibility(query, user, team_col=AgentRunLog.team_id, owner_col=AgentRunLog.triggered_by)
+    query = apply_visibility(query, user, team_col=AgentRunLog.team_id, owner_col=AgentRunLog.triggered_by)
     if agent_id:
         query = query.where(AgentRunLog.agent_id == agent_id)
     if outcome:
@@ -439,7 +416,7 @@ async def get_run(
     user: User = Depends(require_role("analyst")),
 ):
     run = session.exec(select(AgentRunLog).where(AgentRunLog.run_id == run_id)).first()
-    if not run or not _check_visibility(run, user, team_id_attr="team_id", owner_id_attr="triggered_by"):
+    if not run or not check_visibility(run, user, team_id_attr="team_id", owner_id_attr="triggered_by"):
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
     return run
 
@@ -451,7 +428,7 @@ async def get_run_trace(
     user: User = Depends(require_role("analyst")),
 ):
     run = session.exec(select(AgentRunLog).where(AgentRunLog.run_id == run_id)).first()
-    if not run or not _check_visibility(run, user, team_id_attr="team_id", owner_id_attr="triggered_by"):
+    if not run or not check_visibility(run, user, team_id_attr="team_id", owner_id_attr="triggered_by"):
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
 
     if run.trace_json is None:

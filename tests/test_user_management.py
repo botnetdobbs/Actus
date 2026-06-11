@@ -112,3 +112,29 @@ def test_password_reset_not_found(client, engine):
         headers=auth_header(token),
     )
     assert resp.status_code == 404
+
+
+# ── PATCH /auth/users/{id}/role — last-admin protection ──────────────────────
+
+def test_cannot_demote_last_admin(client, engine):
+    admin = seed_user(engine, "lastadmin", "admin")
+    token = get_token(client, "lastadmin")
+    resp = client.patch(
+        f"/v1/auth/users/{admin.id}/role",
+        json={"role": "viewer"},
+        headers=auth_header(token),
+    )
+    assert resp.status_code == 400
+
+
+def test_can_demote_admin_when_another_admin_remains(client, engine):
+    seed_user(engine, "admin8", "admin")
+    target = seed_user(engine, "admin9", "admin")
+    token = get_token(client, "admin8")
+    resp = client.patch(
+        f"/v1/auth/users/{target.id}/role",
+        json={"role": "viewer"},
+        headers=auth_header(token),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["role"] == "viewer"

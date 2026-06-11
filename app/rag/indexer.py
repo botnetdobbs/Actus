@@ -34,8 +34,6 @@ def _object_to_text(type_name: str, obj: Any) -> str:
             continue
         if value is None:
             continue
-        if isinstance(value, bool):
-            continue
         if field.endswith("_id") and isinstance(value, int):  # skip foreign keys
             continue
         parts.append(f"{field}: {value}")
@@ -48,9 +46,11 @@ def index_object(type_name: str, object_id: int, obj) -> None:
     try:
         text = _object_to_text(type_name, obj)
         embedding = embed(text)
+        team_id = getattr(obj, "team_id", None)
         stmt = pg_insert(VectorIndex).values(
             object_type=type_name,
             object_id=object_id,
+            team_id=team_id,
             document=text,
             embedding=embedding,
             created_at=datetime.now(timezone.utc),
@@ -58,6 +58,7 @@ def index_object(type_name: str, object_id: int, obj) -> None:
         stmt = stmt.on_conflict_do_update(
             constraint="uq_vector_indexes_type_id",
             set_={
+                "team_id": stmt.excluded.team_id,
                 "document": stmt.excluded.document,
                 "embedding": stmt.excluded.embedding,
                 "created_at": stmt.excluded.created_at,
@@ -71,7 +72,7 @@ def index_object(type_name: str, object_id: int, obj) -> None:
         log.error("rag_index_failed", type=type_name, id=object_id, error=str(e))
 
 
-def index_text(type_name: str, object_id: int, text: str) -> None:
+def index_text(type_name: str, object_id: int, text: str, team_id: int | None = None) -> None:
     """Index a raw text string into VectorIndex. No-op on SQLite. Re-raises on failure."""
     if not _is_postgres():
         return
@@ -79,6 +80,7 @@ def index_text(type_name: str, object_id: int, text: str) -> None:
     stmt = pg_insert(VectorIndex).values(
         object_type=type_name,
         object_id=object_id,
+        team_id=team_id,
         document=text,
         embedding=embedding,
         created_at=datetime.now(timezone.utc),
@@ -86,6 +88,7 @@ def index_text(type_name: str, object_id: int, text: str) -> None:
     stmt = stmt.on_conflict_do_update(
         constraint="uq_vector_indexes_type_id",
         set_={
+            "team_id": stmt.excluded.team_id,
             "document": stmt.excluded.document,
             "embedding": stmt.excluded.embedding,
             "created_at": stmt.excluded.created_at,

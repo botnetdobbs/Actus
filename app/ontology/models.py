@@ -9,6 +9,10 @@ class OntologyObjectBase(SQLModel):
     Base class for all ontology types. Provides audit fields, soft delete,
     and RAG indexing (automatic on create/update via the ontology router).
 
+    NOTE: `team_id` (nullable) scopes records to a team, following the same
+    convention as `User.team_id`/`Workflow.team_id`: NULL means global/unscoped
+    (visible to everyone), non-null restricts visibility.
+
     To define a new type:
 
         @register("Invoice")
@@ -26,6 +30,7 @@ class OntologyObjectBase(SQLModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     created_by: int | None = None
+    team_id: int | None = Field(default=None, index=True)
     is_deleted: bool = Field(default=False, index=True)
     deleted_at: datetime | None = None
     deleted_by: int | None = None

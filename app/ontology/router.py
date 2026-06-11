@@ -6,12 +6,15 @@ from app.database import get_session
 from app.ontology.models import OntologyObjectBase
 from app.ontology.registry import get_type, list_types
 from app.auth.models import User
-from app.auth.jwt import get_current_user, write_audit_log
+from app.auth.jwt import get_current_user, require_role, write_audit_log
+from app.auth.visibility import apply_visibility, check_visibility
 from app.rag.indexer import delete_from_index, index_object
 import structlog
 
 log = structlog.get_logger()
 router = APIRouter()
+
+_PROTECTED_FIELDS = {"id", "created_at", "created_by", "is_deleted", "deleted_at", "deleted_by"}
 
 
 @router.get("/types")
@@ -23,6 +26,7 @@ def get_ontology_types():
 def list_objects(
     type_name: str,
     session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
     limit: int = 50,
     offset: int = 0,
 ):
@@ -30,9 +34,9 @@ def list_objects(
         cls = cast(type[OntologyObjectBase], get_type(type_name))
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Unknown type: {type_name}")
-    results = session.exec(
-        select(cls).where(col(cls.is_deleted).is_(False)).offset(offset).limit(limit)
-    ).all()
+    query = select(cls).where(col(cls.is_deleted).is_(False))
+    query = apply_visibility(query, user, team_col=cls.team_id, owner_col=cls.created_by)
+    results = session.exec(query.offset(offset).limit(limit)).all()
     return {"type": type_name, "count": len(results), "items": results}
 
 
@@ -41,6 +45,7 @@ def get_object(
     type_name: str,
     object_id: int,
     session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
 ):
     try:
         cls = cast(type[OntologyObjectBase], get_type(type_name))
@@ -48,6 +53,8 @@ def get_object(
         raise HTTPException(status_code=404, detail=f"Unknown type: {type_name}")
     obj = session.get(cls, object_id)
     if not obj or obj.is_deleted:
+        raise HTTPException(status_code=404, detail="Object not found")
+    if not check_visibility(obj, user, team_id_attr="team_id", owner_id_attr="created_by"):
         raise HTTPException(status_code=404, detail="Object not found")
     return obj
 
@@ -59,7 +66,7 @@ def create_object(
     request: Request,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_role("analyst")),
 ):
     try:
         cls = cast(type[OntologyObjectBase], get_type(type_name))
@@ -76,6 +83,7 @@ def create_object(
     except (ValidationError, TypeError) as e:
         raise HTTPException(status_code=422, detail=str(e))
     obj.created_by = user.id
+    obj.team_id = user.team_id
     try:
         session.add(obj)
         session.commit()
@@ -99,7 +107,7 @@ def update_object(
     request: Request,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_role("analyst")),
 ):
     try:
         cls = cast(type[OntologyObjectBase], get_type(type_name))
@@ -108,8 +116,13 @@ def update_object(
     unknown = [k for k in payload if k not in cls.model_fields]
     if unknown:
         raise HTTPException(status_code=422, detail=f"Unknown fields: {unknown}")
+    protected = [k for k in payload if k in _PROTECTED_FIELDS]
+    if protected:
+        raise HTTPException(status_code=422, detail=f"Cannot modify protected fields: {protected}")
     obj = session.get(cls, object_id)
     if not obj or obj.is_deleted:
+        raise HTTPException(status_code=404, detail="Object not found")
+    if not check_visibility(obj, user, team_id_attr="team_id", owner_id_attr="created_by"):
         raise HTTPException(status_code=404, detail="Object not found")
     try:
         for key, value in payload.items():
@@ -136,7 +149,7 @@ def delete_object(
     request: Request,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_role("analyst")),
 ):
     try:
         cls = cast(type[OntologyObjectBase], get_type(type_name))
@@ -144,6 +157,8 @@ def delete_object(
         raise HTTPException(status_code=404, detail=f"Unknown type: {type_name}")
     obj = session.get(cls, object_id)
     if not obj or obj.is_deleted:
+        raise HTTPException(status_code=404, detail="Object not found")
+    if not check_visibility(obj, user, team_id_attr="team_id", owner_id_attr="created_by"):
         raise HTTPException(status_code=404, detail="Object not found")
     obj.soft_delete(deleted_by=user.id)
     session.add(obj)

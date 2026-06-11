@@ -82,6 +82,46 @@ def test_invalid_json_in_fence_raises():
         loads("```json\nnot json\n```")
 
 
+# ── run_tool: error truncation ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_run_tool_truncates_long_error():
+    from app.agents.tools import run_tool, _tools, _MAX_TOOL_ERROR_CHARS
+
+    def boom(**kwargs):
+        raise ValueError("x" * (_MAX_TOOL_ERROR_CHARS + 50))
+
+    _tools["__boom_test__"] = boom
+    try:
+        result = await run_tool("__boom_test__")
+    finally:
+        del _tools["__boom_test__"]
+
+    assert result.success is False
+    assert len(result.error) == _MAX_TOOL_ERROR_CHARS
+
+
+@pytest.mark.asyncio
+async def test_run_tool_propagates_team_id_context_to_sync_tool():
+    from app.agents.tools import run_tool, _tools, _team_id_context
+
+    observed = {}
+
+    def reads_team_id(**kwargs):
+        observed["team_id"] = _team_id_context.get()
+        return "ok"
+
+    _tools["__team_ctx_test__"] = reads_team_id
+    token = _team_id_context.set(123)
+    try:
+        await run_tool("__team_ctx_test__")
+    finally:
+        _team_id_context.reset(token)
+        del _tools["__team_ctx_test__"]
+
+    assert observed["team_id"] == 123
+
+
 # ── run_agent: happy path ─────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -236,6 +276,56 @@ async def test_rag_no_template_skips_retrieval():
          patch("app.agents.orchestrator.save_context"):
         await run_agent(make_config())
     mock_retrieve.assert_not_called()
+
+
+# ── team_id threading ─────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_run_agent_threads_explicit_team_id_to_retrieve():
+    with patch("app.agents.orchestrator.retrieve", return_value=[]) as mock_retrieve, \
+         patch("app.agents.orchestrator.call_llm_with_retry", AsyncMock(return_value=DONE)), \
+         patch("app.agents.orchestrator.save_context"):
+        await run_agent(make_config(rag_query_template="enterprise customers"), team_id=7)
+    _, kwargs = mock_retrieve.call_args
+    assert kwargs["team_id"] == 7
+
+
+@pytest.mark.asyncio
+async def test_run_agent_inherits_team_id_from_context():
+    from app.agents.tools import _team_id_context
+    token = _team_id_context.set(99)
+    try:
+        with patch("app.agents.orchestrator.retrieve", return_value=[]) as mock_retrieve, \
+             patch("app.agents.orchestrator.call_llm_with_retry", AsyncMock(return_value=DONE)), \
+             patch("app.agents.orchestrator.save_context"):
+            await run_agent(make_config(rag_query_template="enterprise customers"))
+    finally:
+        _team_id_context.reset(token)
+    _, kwargs = mock_retrieve.call_args
+    assert kwargs["team_id"] == 99
+
+
+@pytest.mark.asyncio
+async def test_nested_invoke_agent_inherits_team_id():
+    child_result = {"status": "completed", "result": "ok",
+                    "confidence": 0.9, "iterations": 1, "total_tokens": 50}
+    observed = {}
+
+    async def fake_run_agent(config, **kwargs):
+        from app.agents.tools import _team_id_context
+        observed["team_id"] = _team_id_context.get()
+        return child_result
+
+    async def parent_inner(*args, **kwargs):
+        from app.agents.tools import invoke_agent
+        return await invoke_agent(agent_id="child", query="go")
+
+    with patch("app.agents.builder.get_agent", return_value=make_config(id="child")), \
+         patch("app.agents.orchestrator.run_agent", side_effect=fake_run_agent), \
+         patch("app.agents.orchestrator._run_agent_inner", side_effect=parent_inner):
+        await run_agent(make_config(id="parent"), team_id=7)
+
+    assert observed["team_id"] == 7
 
 
 # ── invoke_agent and invoke_agents_parallel ───────────────────────────────────

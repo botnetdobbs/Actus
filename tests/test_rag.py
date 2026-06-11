@@ -50,7 +50,7 @@ def test_object_to_text_excludes_metadata():
     assert "created_by" not in text
 
 
-def test_object_to_text_skips_booleans():
+def test_object_to_text_includes_domain_booleans():
     from app.rag.indexer import _object_to_text
 
     class FakeObj:
@@ -59,8 +59,19 @@ def test_object_to_text_skips_booleans():
 
     text = _object_to_text("Customer", FakeObj())
     assert "Bob" in text
-    assert "is_active" not in text
-    assert "verified" not in text
+    assert "is_active: True" in text
+    assert "verified: False" in text
+
+
+def test_object_to_text_excludes_is_deleted_metadata_boolean():
+    from app.rag.indexer import _object_to_text
+
+    class FakeObj:
+        def model_dump(self):
+            return {"name": "Bob", "is_deleted": True}
+
+    text = _object_to_text("Customer", FakeObj())
+    assert "is_deleted" not in text
 
 
 def test_object_to_text_skips_foreign_keys():
@@ -120,6 +131,27 @@ def test_index_object_executes_upsert():
 
     mock_session.execute.assert_called_once()
     mock_session.commit.assert_called_once()
+
+
+def test_index_object_persists_team_id():
+    class FakeObj:
+        team_id = 7
+
+        def model_dump(self):
+            return {"name": "Bob", "segment": "starter"}
+
+    with patch("app.rag.indexer._is_postgres", return_value=True), \
+         patch("app.rag.indexer.embed", return_value=[0.1, 0.2, 0.3]), \
+         patch("app.rag.indexer.get_engine"), \
+         patch("app.rag.indexer.Session") as mock_session_cls, \
+         patch("app.rag.indexer.pg_insert") as mock_pg_insert:
+        mock_session = MagicMock()
+        mock_session_cls.return_value.__enter__.return_value = mock_session
+        from app.rag.indexer import index_object
+        index_object("Customer", 1, FakeObj())
+
+    _, kwargs = mock_pg_insert.return_value.values.call_args
+    assert kwargs["team_id"] == 7
 
 
 def test_index_object_swallows_errors():
@@ -214,6 +246,21 @@ def test_retrieve_empty_query_returns_empty():
     assert results == []
 
 
+def test_retrieve_applies_team_id_filter():
+    with patch("app.rag.retriever.embed", return_value=[0.1, 0.2]), \
+         patch("app.rag.retriever.get_engine"), \
+         patch("app.rag.retriever.Session") as mock_session_cls:
+        mock_session = MagicMock()
+        mock_session_cls.return_value.__enter__.return_value = mock_session
+        mock_session.exec.return_value.all.return_value = []
+        from app.rag.retriever import retrieve
+        retrieve("find alice", team_id=5)
+
+    sem_q, fts_q = [c.args[0] for c in mock_session.exec.call_args_list]
+    assert "team_id" in str(sem_q)
+    assert "team_id" in str(fts_q)
+
+
 def test_retrieve_rrf_boosts_shared_results():
     # A row appearing in both semantic and FTS gets a higher RRF score
     shared = _make_row("Customer", 1, "Customer name: Alice")
@@ -249,5 +296,16 @@ def test_semantic_search_tool_calls_retrieve():
     with patch("app.rag.retriever.retrieve", return_value=[]) as mock_retrieve:
         from app.agents.tools import _tools
         result = _tools["semantic_search"](query="test", type_name="", top_k=3)
-    mock_retrieve.assert_called_once_with("test", type_name=None, top_k=3)
+    mock_retrieve.assert_called_once_with("test", type_name=None, top_k=3, team_id=None)
     assert isinstance(result, list)
+
+
+def test_semantic_search_tool_uses_team_id_context():
+    from app.agents.tools import _tools, _team_id_context
+    with patch("app.rag.retriever.retrieve", return_value=[]) as mock_retrieve:
+        token = _team_id_context.set(42)
+        try:
+            _tools["semantic_search"](query="test", type_name="", top_k=3)
+        finally:
+            _team_id_context.reset(token)
+    mock_retrieve.assert_called_once_with("test", type_name=None, top_k=3, team_id=42)

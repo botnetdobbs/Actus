@@ -50,9 +50,11 @@ def client(engine):
     application.dependency_overrides.clear()
 
 
-def seed_user(engine, username: str, role: str, password: str = "testpass") -> User:
+def seed_user(engine, username: str, role: str, password: str = "testpass",
+               team_id: int | None = None) -> User:
     with Session(engine) as session:
-        user = User(username=username, hashed_password=hash_password(password), role=role)
+        user = User(username=username, hashed_password=hash_password(password), role=role,
+                     team_id=team_id)
         session.add(user)
         session.commit()
         session.refresh(user)

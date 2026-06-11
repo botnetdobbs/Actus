@@ -992,3 +992,40 @@ def test_remove_team_from_user(client, engine):
                         json={"team_id": None}, headers=auth_header(token))
     assert resp.status_code == 200
     assert resp.json()["team_id"] is None
+
+
+# ── _run_workflow: team_id threading ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_run_workflow_passes_wf_team_id_to_run_agent(engine):
+    from app.automation.router import _run_workflow
+    from app.database import get_engine
+
+    with Session(get_engine()) as session:
+        wf = Workflow(name="Test Agent", agent_id="test-agent", team_id=42)
+        session.add(wf)
+        session.commit()
+        session.refresh(wf)
+        workflow_id = wf.id
+
+    completed_result = {
+        "run_id": "abc", "result": "done", "confidence": 0.9, "iterations": 1,
+        "status": "completed", "prompt_tokens": 1, "completion_tokens": 1,
+        "total_tokens": 2, "tool_calls": [], "pii_detected": False,
+        "output_schema_valid": None, "output_schema_errors": None, "trace": [],
+    }
+
+    async def fake_run_agent_with_timeout(config, extra_context=None, event_queue=None, **kwargs):
+        if event_queue is not None:
+            await event_queue.put(None)  # end-of-stream sentinel, as the real run_agent does
+        return completed_result
+
+    with patch("app.automation.router.get_agent", return_value=make_agent_config()), \
+         patch("app.automation.router.run_agent_with_timeout",
+               side_effect=fake_run_agent_with_timeout) as mock_run, \
+         patch("app.automation.router.log_agent_run"), \
+         patch("app.pubsub.publish_event", new=AsyncMock(return_value=None)):
+        await _run_workflow(workflow_id, triggered_by=None, ip_address=None)
+
+    _, kwargs = mock_run.call_args
+    assert kwargs["team_id"] == 42

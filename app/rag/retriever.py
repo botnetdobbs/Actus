@@ -1,6 +1,6 @@
 import structlog
 from sqlalchemy import func
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
 from app.database import get_engine
 from app.rag.embedder import embed
@@ -15,7 +15,8 @@ def _rrf_score(rank: int) -> float:
     return 1.0 / (_RRF_K + rank + 1)
 
 
-def retrieve(query: str, type_name: str | None = None, top_k: int = 5) -> list[dict]:
+def retrieve(query: str, type_name: str | None = None, top_k: int = 5,
+              team_id: int | None = None) -> list[dict]:
     if not query.strip():
         return []
 
@@ -30,6 +31,8 @@ def retrieve(query: str, type_name: str | None = None, top_k: int = 5) -> list[d
         )
         if type_name:
             sem_q = sem_q.where(VectorIndex.object_type == type_name)
+        if team_id is not None:
+            sem_q = sem_q.where((col(VectorIndex.team_id) == team_id) | (col(VectorIndex.team_id).is_(None)))
         semantic_rows = session.exec(sem_q).all()
 
         # Full-text search — PostgreSQL tsvector
@@ -38,6 +41,8 @@ def retrieve(query: str, type_name: str | None = None, top_k: int = 5) -> list[d
         fts_q = select(VectorIndex).where(fts_filter).limit(top_k)
         if type_name:
             fts_q = fts_q.where(VectorIndex.object_type == type_name)
+        if team_id is not None:
+            fts_q = fts_q.where((col(VectorIndex.team_id) == team_id) | (col(VectorIndex.team_id).is_(None)))
         try:
             fts_rows = session.exec(fts_q).all()
         except Exception as e:

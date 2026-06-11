@@ -5,7 +5,10 @@ import jsonschema
 import litellm
 import structlog
 from app.agents.builder import AgentConfig
-from app.agents.tools import run_tool, to_openai_tools, _supports_native_tools, _tool_schemas, _invoke_stack
+from app.agents.tools import (
+    run_tool, to_openai_tools, _supports_native_tools, _tool_schemas, _invoke_stack,
+    INHERIT_TEAM_ID, _team_id_context,
+)
 from app.context.models import AgentContext, ContextualData
 from app.context.store import save_context
 from app.rag.retriever import retrieve
@@ -112,21 +115,25 @@ def _validate_against_schema(result: str, schema: dict) -> tuple[bool, str]:
 
 
 async def run_agent(config: AgentConfig, extra_context: dict | None = None,
-                    event_queue: asyncio.Queue | None = None) -> dict:
+                    event_queue: asyncio.Queue | None = None,
+                    team_id: int | None = INHERIT_TEAM_ID) -> dict:
     run_id = str(uuid.uuid4())
     bound_log = log.bind(agent_id=config.id, run_id=run_id)
     bound_log.info("agent_run_start")
     active_agent_runs.inc()
     _stack_token = _invoke_stack.set(_invoke_stack.get() + [config.id])
+    effective_team_id = _team_id_context.get() if team_id is INHERIT_TEAM_ID else team_id
+    _team_token = _team_id_context.set(effective_team_id)
     status = "unknown"
     try:
-        result = await _run_agent_inner(config, run_id, bound_log, extra_context, event_queue)
+        result = await _run_agent_inner(config, run_id, bound_log, extra_context, event_queue, effective_team_id)
         status = result.get("status", "unknown")
         return result
     except Exception:
         status = "error"
         raise
     finally:
+        _team_id_context.reset(_team_token)
         _invoke_stack.reset(_stack_token)
         active_agent_runs.dec()
         agent_runs_total.labels(agent_id=config.id, status=status).inc()
@@ -140,6 +147,7 @@ async def _run_agent_inner(
     bound_log,
     extra_context: dict | None,
     event_queue: asyncio.Queue | None = None,
+    team_id: int | None = None,
 ) -> dict:
     async def _emit(event: dict) -> None:
         if event_queue is not None:
@@ -179,7 +187,7 @@ async def _run_agent_inner(
         try:
             loop = asyncio.get_running_loop()
             retrieved = await loop.run_in_executor(
-                None, lambda: retrieve(rag_query, top_k=config.rag_top_k)
+                None, lambda: retrieve(rag_query, top_k=config.rag_top_k, team_id=team_id)
             )
             if retrieved:
                 raw_text = "\n".join(
@@ -529,10 +537,11 @@ async def _run_agent_inner(
 
 
 async def run_agent_with_timeout(config: AgentConfig, extra_context: dict | None = None,
-                                  event_queue: asyncio.Queue | None = None) -> dict:
+                                  event_queue: asyncio.Queue | None = None,
+                                  team_id: int | None = INHERIT_TEAM_ID) -> dict:
     try:
         return await asyncio.wait_for(
-            run_agent(config, extra_context=extra_context, event_queue=event_queue),
+            run_agent(config, extra_context=extra_context, event_queue=event_queue, team_id=team_id),
             timeout=AGENT_TOTAL_TIMEOUT,
         )
     except asyncio.TimeoutError:

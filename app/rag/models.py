@@ -19,6 +19,7 @@ class VectorIndex(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     object_type: str = Field(index=True)
     object_id: int = Field(index=True)
+    team_id: int | None = Field(default=None, index=True)
     document: str
     embedding: Any = Field(default=None, sa_column=Column(Vector(VECTOR_DIM)))
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
