@@ -59,14 +59,6 @@ def test_trigger_analyst_queues_agent(client, engine):
     assert "workflow_id" in body
 
 
-def test_outcome_map_completed_becomes_success():
-    from app.automation.router import _OUTCOME_MAP
-    assert _OUTCOME_MAP["completed"] == "success"
-    assert _OUTCOME_MAP["incomplete"] == "incomplete"
-    assert _OUTCOME_MAP["error"] == "error"
-    assert _OUTCOME_MAP["timeout"] == "timeout"
-
-
 def test_trigger_admin_can_trigger(client, engine):
     seed_user(engine, "admin1", "admin")
     token = get_token(client, "admin1")

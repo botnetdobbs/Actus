@@ -14,3 +14,5 @@ doc/
 .env
 *.db
 data/
+.coverage
+htmlcov/

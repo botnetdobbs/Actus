@@ -560,7 +560,7 @@ watch -n 2 curl -s "http://localhost:8000/v1/automation/workflows/$WF_ID" \
 ### Unit-test an agent (mock the LLM)
 
 ```python
-# tests/test_my_agent.py
+# tests/unit/test_my_agent.py
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from app.agents.orchestrator import run_agent

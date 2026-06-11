@@ -1,7 +1,10 @@
-.PHONY: test lint typecheck migrate backfill-rag migrations docker-build docker-up docker-up-d ollama-pull docker-down docker-logs docker-restart docker-rebuild dev dev-d dev-down dev-rebuild
+.PHONY: test test-cov lint typecheck migrate backfill-rag migrations docker-build docker-up docker-up-d ollama-pull docker-down docker-logs docker-restart docker-rebuild dev dev-d dev-down dev-rebuild
 
 test:
 	uv run python -m pytest tests/ -v
+
+test-cov:
+	uv run python -m pytest tests/ --cov=app --cov-report=term-missing
 
 lint:
 	uv run ruff check .
