@@ -1,5 +1,7 @@
 # Actus
 
+![CI](https://github.com/botnet-dobbs/Actus/actions/workflows/ci.yml/badge.svg)
+
 **FastAPI-based multi-agent platform with LLM routing, RAG-powered context retrieval, and operational automation.**
 
 Actus is a self-hosted automation platform that your team deploys and fully controls. Deploy it, register agents for your operations, and let them work autonomously on your data.
@@ -26,7 +28,7 @@ pytest + httpx
 **Prerequisites:** Docker and Docker Compose.
 
 ```bash
-git clone https://github.com/you/actus && cd actus
+git clone https://github.com/botnet-dobbs/Actus && cd Actus
 
 cp .env.example .env
 # Edit .env and set SECRET_KEY, POSTGRES_PASSWORD, and GRAFANA_PASSWORD
