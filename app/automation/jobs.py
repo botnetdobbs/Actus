@@ -97,19 +97,16 @@ def _purge_temp_uploads(cutoff: datetime) -> None:
             log.warning("temp_upload_unlink_failed", path=str(f), error=str(e))
 
 
-def _make_agent_job(agent_id: str):
-    """Return a coroutine function that runs a named agent with full timeout protection."""
-    async def _run():
-        try:
-            config = get_agent(agent_id)
-            result = await run_agent_with_timeout(config)
-            log.info("scheduled_agent_complete", agent_id=agent_id, run_id=result.get("run_id"))
-        except KeyError:
-            log.error("scheduled_agent_not_found", agent_id=agent_id)
-        except Exception as e:
-            log.error("scheduled_agent_failed", agent_id=agent_id, error=str(e), exc_info=True)
-    _run.__name__ = f"scheduled_{agent_id}"
-    return _run
+async def _run_scheduled_agent(agent_id: str) -> None:
+    """Run a named agent. Defined at module level so APScheduler can serialize it to the database."""
+    try:
+        config = get_agent(agent_id)
+        result = await run_agent_with_timeout(config)
+        log.info("scheduled_agent_complete", agent_id=agent_id, run_id=result.get("run_id"))
+    except KeyError:
+        log.error("scheduled_agent_not_found", agent_id=agent_id)
+    except Exception as e:
+        log.error("scheduled_agent_failed", agent_id=agent_id, error=str(e), exc_info=True)
 
 
 _STUCK_WORKFLOW_BUFFER_SECONDS = 60

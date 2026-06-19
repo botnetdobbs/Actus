@@ -5,7 +5,7 @@ from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from apscheduler.triggers.cron import CronTrigger
 from app.config import get_settings
 from app.agents.builder import list_agents
-from app.automation.jobs import register_all_jobs, _make_agent_job
+from app.automation.jobs import register_all_jobs, _run_scheduled_agent
 import structlog
 
 log = structlog.get_logger()
@@ -35,10 +35,12 @@ def start_scheduler() -> None:
     register_all_jobs(scheduler)
     for config in list_agents():
         if config.schedule and config.schedule.cron:
-            grace = config.schedule.misfire_grace_time if config.schedule.misfire_grace_time is not None else 3600
+            mgtime = config.schedule.misfire_grace_time
+            grace = None if mgtime == 0 else (mgtime if mgtime is not None else 3600)
             scheduler.add_job(
-                _make_agent_job(config.id),
+                _run_scheduled_agent,
                 CronTrigger.from_crontab(config.schedule.cron),
+                args=[config.id],
                 id=f"agent_{config.id}",
                 replace_existing=True,
                 misfire_grace_time=grace,

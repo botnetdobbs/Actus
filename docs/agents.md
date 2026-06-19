@@ -135,15 +135,17 @@ On failure, raise an exception. The orchestrator catches it and reports `{"error
 
 Place your tools in `app/agents/{agent_id}/tools.py` and they are discovered automatically. At startup, `discover_tools()` scans every `app/agents/*/tools.py` and imports it. No changes to `main.py` needed.
 
+The folder name must match the agent `id` in the YAML. For example, an agent with `id: trading_momentum` must live in `app/agents/trading_momentum/`. A mismatch does not prevent the tools from loading, but it breaks the convention and makes the project harder to navigate.
+
 ```
 app/
 └── agents/
-    ├── tools.py          ← platform built-ins (semantic_search, invoke_agent, …)
-    ├── doc_qa/
+    ├── tools.py          ← platform built-ins (semantic_search, invoke_agent, ...)
+    ├── doc_qa/           ← folder name matches YAML id: doc_qa
     │   ├── tools.py      ← auto-discovered: @tool decorators registered
     │   ├── router.py     ← auto-registered: must export APIRouter with prefix+tags
     │   └── models.py     ← auto-imported: SQLModel table metadata registered
-    └── crm/
+    └── crm/              ← folder name matches YAML id: crm
         └── tools.py      ← only tools.py needed if no HTTP routes or DB tables
 ```
 
